@@ -162,12 +162,25 @@ class VLA(nn.Module):
         if self.cfg.head == "flow":
             h = self.llm.model(inputs_embeds=prefix, attention_mask=mask, position_ids=self._pos(mask),
                                use_cache=False).last_hidden_state
-            main = flow_loss(self.dit, batch["actions"].to(h.dtype), batch["proprio"].to(h.dtype), h, mask)
+            if "swap" in batch:  # counterfactual-colour rows have no valid action target: exclude from the action loss
+                rows = flow_loss(self.dit, batch["actions"].to(h.dtype), batch["proprio"].to(h.dtype), h, mask,
+                                 per_row=True)
+                keep = 1.0 - batch["swap"].float()
+                main = (rows * keep).sum() / keep.sum().clamp(min=1.0)
+            else:
+                main = flow_loss(self.dit, batch["actions"].to(h.dtype), batch["proprio"].to(h.dtype), h, mask)
             return self._with_ground({"main_loss": main}, h[:, P - 1], batch)
         bins = self.act_tok.encode_bins(batch["actions"].reshape(batch["actions"].shape[0], -1))  # [B,16]
         logits, h_last = self._discrete_logits(prefix, mask, bins)
-        main = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), bins.reshape(-1))
-        acc = (logits.argmax(-1) == bins).float().mean()
+        if "swap" in batch:
+            keep = 1.0 - batch["swap"].float()
+            den = keep.sum().clamp(min=1.0)
+            ce = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), bins.reshape(-1), reduction="none").view(bins.shape)
+            main = (ce.mean(1) * keep).sum() / den
+            acc = (((logits.argmax(-1) == bins).float().mean(1)) * keep).sum() / den
+        else:
+            main = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), bins.reshape(-1))
+            acc = (logits.argmax(-1) == bins).float().mean()
         return self._with_ground({"main_loss": main, "tok_acc": acc}, h_last, batch)
 
     def _with_ground(self, out: dict, h_last: torch.Tensor, batch: dict) -> dict:

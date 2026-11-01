@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import h5py
@@ -12,12 +13,22 @@ from torch.utils.data import Dataset
 from vla.model.prompts import encode_instructions
 
 
+COLORS = ("red", "green", "blue")  # cube index order in the sim
+_COLOR_RE = re.compile(r"the (red|green|blue) cube")
+
+
 class VLADataset(Dataset):
     """part: all | train | val  (val = every 20th episode globally, i.e. 5% held-out demos for tok_acc).
     subset: optional path to a subset_{pct}.json index file ([[shard, ep], ...])."""
 
-    def __init__(self, root: str, chunk: int = 4, part: str = "all", subset: str | None = None):
+    def __init__(self, root: str, chunk: int = 4, part: str = "all", subset: str | None = None,
+                 swap_p: float = 0.0, seed: int = 0):
+        """swap_p > 0: counterfactual colour queries (Amendment A). With probability swap_p per sample the cube colour
+        word in the instruction is replaced by another colour, the aux label becomes THAT cube's xy, and the sample
+        carries swap=1 (excluded from the action loss). Deterministic: rng = default_rng([seed, epoch, index]).
+        swap_p == 0 returns exactly the previous items (no 'swap' key)."""
         self.root, self.chunk = Path(root), chunk
+        self.swap_p, self.seed, self.epoch = swap_p, seed, 0
         st = json.load(open(self.root / "stats.json"))
         self.p_mean = np.array(st["proprio_mean"], np.float32)
         self.p_std = np.array(st["proprio_std"], np.float32)
@@ -52,6 +63,9 @@ class VLADataset(Dataset):
         # frame index within its episode (t=0 is the reset frame): used for early-frame oversampling
         self.frame_t = (np.arange(len(self.frame_ep)) - self.ep_first[self.frame_ep]) if len(self.ep_len) else np.array([])
 
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
     def __len__(self) -> int:
         return len(self.frame_ep)
 
@@ -76,17 +90,34 @@ class VLADataset(Dataset):
             gmask = 1.0
         else:  # legacy shard without cube_pos: no label
             gxy, gmask = np.zeros(2, np.float32), 0.0
-        return {"image": torch.from_numpy(f["images"][row]),
+        instr = self.instr[e]
+        swap = None
+        if self.swap_p > 0 and self._has_cp[int(self.ep_shard[e])]:
+            rng = np.random.default_rng([self.seed, self.epoch, i])
+            m = _COLOR_RE.search(instr)
+            if m is not None and rng.random() < self.swap_p:
+                others = [c for c in COLORS if c != m.group(1)]
+                new = others[int(rng.integers(len(others)))]
+                instr = instr[:m.start(1)] + new + instr[m.end(1):]
+                gxy = (f["cube_pos"][row, COLORS.index(new), :2] - self.g_mean) / self.g_std
+                swap = 1.0
+            else:
+                swap = 0.0
+        item = {"image": torch.from_numpy(f["images"][row]),
                 "ground_xy": torch.from_numpy(np.asarray(gxy, np.float32)),
                 "ground_mask": torch.tensor(gmask, dtype=torch.float32),
                 "proprio": torch.from_numpy((f["proprio"][row] - self.p_mean) / self.p_std),
                 "actions": torch.from_numpy(acts),
-                "action_mask": torch.from_numpy(mask), "instruction": self.instr[e]}
+                "action_mask": torch.from_numpy(mask), "instruction": instr}
+        if swap is not None:
+            item["swap"] = torch.tensor(swap, dtype=torch.float32)
+        return item
 
 
 def make_collate(tokenizer):
     def collate(items: list[dict]) -> dict:
-        out = {k: torch.stack([it[k] for it in items]) for k in ("image", "proprio", "actions", "action_mask", "ground_xy", "ground_mask")}
+        keys = ["image", "proprio", "actions", "action_mask", "ground_xy", "ground_mask"] + (["swap"] if "swap" in items[0] else [])
+        out = {k: torch.stack([it[k] for it in items]) for k in keys}
         out.update(encode_instructions(tokenizer, [it["instruction"] for it in items]))
         return out
 

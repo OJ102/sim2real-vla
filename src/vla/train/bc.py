@@ -76,6 +76,7 @@ class BCConfig:
     ground_weight: float = 0.0          # >0: aux target-xy grounding loss at the last prefix token (see docs/PLAN_v2_grounding.md)
     early_k: int = 4                    # frames with t < early_k ...
     early_w: int = 1                    # ... are repeated early_w times per epoch (1 = off; grounding configs use 3)
+    ground_swap_p: float = 0.0          # Amendment A: prob. of a counterfactual colour-swapped sample (0 = off)
     stop_at: int = 0                    # >0: save DCP ckpt + export stop_<step>.pt at this step and exit 0 (gate runs)
     keep_best: bool = True              # export best.pt whenever val main_loss improves
     exit_after_step: int = 0            # test aid: hard-exit (like kill -9, no save/flush) after this step
@@ -178,8 +179,11 @@ def main():
         engine, opt, _, _ = deepspeed.initialize(model=model, optimizer=opt, config=ds_cfg)
         model = engine
         base = engine.module
-    ds = VLADataset(data_dir, chunk=mcfg.chunk, part="train", subset=cfg.subset or None)
-    val_ds = VLADataset(data_dir, chunk=mcfg.chunk, part="val")
+    ds = VLADataset(data_dir, chunk=mcfg.chunk, part="train", subset=cfg.subset or None,
+                    swap_p=cfg.ground_swap_p if cfg.ground_weight > 0 else 0.0, seed=cfg.seed)
+    val_ds = VLADataset(data_dir, chunk=mcfg.chunk, part="val")  # never swapped: val_main_loss stays comparable
+    val_ds_swap = (VLADataset(data_dir, chunk=mcfg.chunk, part="val", swap_p=1.0, seed=cfg.seed)
+                   if cfg.ground_weight > 0 and cfg.ground_swap_p > 0 else None)
     collate = make_collate(tok)
     assert cfg.global_batch % (cfg.micro_batch * world) == 0, "global_batch must divide by micro_batch*world"
     accum = cfg.global_batch // (cfg.micro_batch * world)
@@ -257,22 +261,34 @@ def main():
             # early frames only (t < early_k): where the colour decides the heading
             t0 = torch.zeros(2, device=device)
             if cfg.ground_weight > 0:
-                idx0 = np.nonzero(val_ds.frame_t < cfg.early_k)[0][rank::world].tolist()
+                idx0 = np.nonzero(val_ds.frame_t == 0)[0][rank::world].tolist()  # exactly t == 0
                 dl0 = DataLoader(val_ds, batch_size=cfg.micro_batch, sampler=idx0, collate_fn=collate, num_workers=0)
                 for i, b in enumerate(dl0):
                     if i >= cfg.val_batches:
                         break
                     torch.manual_seed(54321 + i)
                     t0 += torch.stack([model(to_dev(b)).get("ground_err_cm", z).detach(), torch.ones((), device=device)])
+            sw = torch.zeros(2, device=device)  # all-swapped val pass: can the word alone steer the aux target?
+            if val_ds_swap is not None:
+                vs2 = ResumableDistributedSampler(len(val_ds_swap), rank, world, seed=0, shuffle=False)
+                dls = DataLoader(val_ds_swap, batch_size=cfg.micro_batch, sampler=vs2, collate_fn=collate, num_workers=0)
+                for i, b in enumerate(dls):
+                    if i >= cfg.val_batches:
+                        break
+                    torch.manual_seed(98765 + i)
+                    sw += torch.stack([model(to_dev(b)).get("ground_err_cm", z).detach(), torch.ones((), device=device)])
         if dist.is_initialized():
             dist.all_reduce(tot)
             dist.all_reduce(t0)
+            dist.all_reduce(sw)
         model.train()
         n = tot[5].clamp(min=1)
         r = {"val_loss": (tot[0] / n).item(), "val_tok_acc": (tot[1] / n).item(), "val_main_loss": (tot[2] / n).item()}
         if cfg.ground_weight > 0:
             r.update({"val_ground_loss": (tot[3] / n).item(), "val_ground_err_cm": (tot[4] / n).item(),
                       "val_ground_err_cm_t0": (t0[0] / t0[1].clamp(min=1)).item()})
+            if val_ds_swap is not None:
+                r["val_ground_err_cm_swap"] = (sw[0] / sw[1].clamp(min=1)).item()
         return r
 
     prof = None
@@ -288,6 +304,7 @@ def main():
     t_prev = time.perf_counter()
     while step < total and not stop:
         sampler.set_epoch(epoch)
+        ds.set_epoch(epoch)  # swap decisions are a pure function of (seed, epoch, index)
         sampler.consumed = in_epoch * per_rank_step
         dl = DataLoader(ds, batch_size=cfg.micro_batch, sampler=sampler, collate_fn=collate,
                         num_workers=cfg.num_workers, drop_last=True, persistent_workers=False,

@@ -77,13 +77,14 @@ def sample_t(batch: int, device, s: float = 0.999) -> torch.Tensor:
     return s * torch.distributions.Beta(1.5, 1.0).sample((batch,)).to(device)
 
 
-def flow_loss(dit: FlowDiT, actions, proprio, ctx, ctx_mask, t=None, noise=None):
+def flow_loss(dit: FlowDiT, actions, proprio, ctx, ctx_mask, t=None, noise=None, per_row: bool = False):
     b = actions.shape[0]
     t = sample_t(b, actions.device) if t is None else t
     eps = torch.randn_like(actions) if noise is None else noise
     x_t = t[:, None, None] * eps + (1 - t[:, None, None]) * actions
     v = dit(x_t, t, proprio, ctx, ctx_mask)
-    return F.mse_loss(v.float(), (eps - actions).float())  # loss in fp32
+    err = (v.float() - (eps - actions).float()) ** 2  # loss in fp32
+    return err.mean((-2, -1)) if per_row else err.mean()
 
 
 @torch.no_grad()

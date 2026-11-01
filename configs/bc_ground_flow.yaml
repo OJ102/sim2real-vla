@@ -1,4 +1,4 @@
-name: bc_gflow
+name: bc_gflow2
 model_config: configs/model_0p5b.yaml
 head: flow
 backend: fsdp
@@ -26,3 +26,4 @@ early_k: 4
 early_w: 3
 val_every: 250
 keep_best: true
+ground_swap_p: 0.25     # Amendment A: counterfactual colour queries
