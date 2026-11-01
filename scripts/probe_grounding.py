@@ -82,7 +82,12 @@ def main():
     ap.add_argument("--override", nargs="*", default=[])
     a = ap.parse_args()
     dev = torch.device(a.device or ("cuda:0" if torch.cuda.is_available() else "cpu"))
-    ov = ([f"head={a.head}"] if a.head else []) + ([f"ground_weight={a.ground_weight}"] if a.ground_weight > 0 else []) + a.override
+    gw = a.ground_weight
+    if gw <= 0 and a.ckpt and Path(a.ckpt).is_file():  # auto-detect a ground head from the weights file
+        if any(k.startswith("ground_head.") for k in torch.load(a.ckpt, map_location="cpu", mmap=True)):
+            gw = 1.0
+            print("ground head detected in checkpoint: building it (ground_weight only matters for training)")
+    ov = ([f"head={a.head}"] if a.head else []) + ([f"ground_weight={gw}"] if gw > 0 else []) + a.override
     model = VLA(load_config(VLAConfig, a.model_config, ov))
     if a.ckpt:
         load_weights(model, a.ckpt)
