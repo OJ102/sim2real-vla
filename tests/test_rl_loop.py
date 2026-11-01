@@ -263,3 +263,10 @@ def test_grpo_loss_gradient_matches_hand_computation():
     # clipped tokens really have zero policy gradient (kl-only gradient)
     clipped = ((advb >= 0) & (r > 1.2)) | ((advb < 0) & (r < 0.8))
     assert clipped.any() and np.allclose(tn.grad.numpy()[clipped], (0.02 * (1 - np.exp(ref - new)) / new.size)[clipped])
+
+
+def test_s0_temperature_not_one_stays_on_policy(tmp_path):
+    _, run, _ = grpo(tmp_path, "rl_t07", "temperature=0.7")
+    for x in recs(run):
+        assert x["engine_mismatch_equal_version"] < 1e-4, x["engine_mismatch_equal_version"]
+        assert x["tis_w_mean"] == pytest.approx(1.0, abs=1e-3) and np.isfinite(x["loss"])

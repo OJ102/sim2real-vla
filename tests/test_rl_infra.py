@@ -264,3 +264,24 @@ def test_engine_sees_updated_weights_in_place():
 def test_engine_rejects_flow_head():
     with pytest.raises(AssertionError):
         InferenceEngine(tiny(0, "flow"))
+
+
+def test_engine_logp_matches_token_logprobs_at_temperature():
+    """Behaviour log-probs are of softmax(logits/T): learner's token_logprobs must use the same T."""
+    m = tiny(0).eval(); batch = _batch(m)
+    with torch.no_grad():
+        m.llm.get_input_embeddings().weight[m.act_base:] *= 30            # informative (non-uniform) logits
+    out = InferenceEngine(m, temperature=0.7).generate(batch, generator=torch.Generator().manual_seed(0))
+    with torch.no_grad():
+        lp07 = m.token_logprobs(batch, out["bins"], 0.7)
+        lp1 = m.token_logprobs(batch, out["bins"])
+        lp1b = m.token_logprobs(batch, out["bins"], temperature=1.0)
+    assert torch.allclose(out["logp"], lp07, atol=1e-4), (out["logp"] - lp07).abs().max()
+    assert not torch.allclose(out["logp"], lp1, atol=1e-3), (out["logp"] - lp1).abs().max()   # T=1 would be wrong
+    assert torch.equal(lp1, lp1b) and (lp07 <= 0).all()
+    # sharper than T=1 on the sampled tokens' average, and still a valid distribution
+    assert lp07.mean() > lp1.mean()
+    # forward() route with bins + temperature agrees
+    fb = dict(batch, bins=out["bins"], temperature=0.7)
+    with torch.no_grad():
+        assert torch.allclose(m(fb)["logp"], lp07, atol=1e-5)

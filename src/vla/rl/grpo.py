@@ -76,6 +76,7 @@ def main():
     ap.add_argument("overrides", nargs="*")
     a = ap.parse_args()
     cfg = load_config(RLConfig, a.config, a.overrides)
+    assert cfg.temperature > 0, "temperature must be > 0 (one cfg.temperature drives both rollout sampling and learner log-probs)"
     rank, world, local, device = init_dist()
     roles = make_roles(cfg.n_learner, cfg.n_rollout)
     assert world == roles.world_size, f"world {world} != {cfg.n_learner}+{cfg.n_rollout}"
