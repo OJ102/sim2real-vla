@@ -282,3 +282,65 @@ def test_ddp_and_fsdp_same_first_loss(demos, runs):
     _ok(run(demos, runs, "cmp_ddp", ["steps=5", "ckpt_every=100", "backend=ddp"]))
     a, b = losses(runs, "cmp_fsdp")[5], losses(runs, "cmp_ddp")[5]
     assert a == pytest.approx(b, rel=1e-3), (a, b)
+
+
+# ------------------------------------------------------------------ async-ckpt deadlock regression (6145a4c)
+DEADLOCK = ["ckpt_mode=async", "ckpt_slow_s=2", "ckpt_every=6", "steps=30", "pg_timeout_min=1"]
+
+
+def test_async_ckpt_slow_writer_no_deadlock(demos, runs):
+    r = run(demos, runs, "async_slow", DEADLOCK, timeout=600)
+    _ok(r)
+    ck = Path(runs) / "async_slow" / "ckpt"
+    assert (ck / "latest").read_text().strip() == "step_000030"
+    assert sorted(p.name for p in ck.glob("step_*")) == ["step_000024", "step_000030"]   # saves at 6,12,..,30; keep 2
+    assert (ck / "step_000030").is_dir() and (Path(runs) / "async_slow" / "final.pt").is_file()
+    assert "Timed out" not in r.stderr
+
+
+@pytest.mark.slow
+def test_async_ckpt_old_shared_pg_deadlock_reproduces(demos, runs, monkeypatch):
+    """The env switch restores the old shared-PG behaviour: it must still time out (proves the test above has teeth)."""
+    monkeypatch.setitem(ENV, "VLA_CKPT_SHARED_PG", "1")
+    try:
+        r = run(demos, runs, "async_slow_bug", DEADLOCK, timeout=600)
+    finally:
+        ENV.pop("VLA_CKPT_SHARED_PG", None)
+    assert r.returncode != 0 and "Timed out" in (r.stderr + r.stdout), (r.returncode, r.stderr[-800:])
+
+
+def test_metrics_have_data_wait_and_compute(demos, runs):
+    _ok(run(demos, runs, "waitmetrics", ["steps=10", "ckpt_every=100"]))
+    recs = [m for m in metrics(runs, "waitmetrics") if "loss" in m]
+    assert recs
+    for m in recs:
+        assert m["data_wait_s"] >= 0 and m["compute_s"] > 0
+        assert m["data_wait_s"] + m["compute_s"] == pytest.approx(m["step_time"], rel=1e-3, abs=1e-4)
+
+
+def test_sigusr2_dumps_stacks_and_does_not_kill(demos, runs):
+    name = "usr2"
+    p = subprocess.Popen(_cmd(demos, runs, name, ["steps=4000", "ckpt_every=100000"]), cwd=ROOT, env=ENV,
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    try:
+        t0 = time.time()
+        while time.time() - t0 < 240 and not any(m.get("step", 0) >= 5 for m in metrics(runs, name)):
+            assert p.poll() is None, p.stdout.read()
+            time.sleep(0.5)
+        assert any(m.get("step", 0) >= 5 for m in metrics(runs, name)), "trainer never started"
+        kids = subprocess.run(["pgrep", "-P", str(p.pid)], capture_output=True, text=True).stdout.split()
+        assert len(kids) == 2, kids                                             # the 2 worker processes
+        for k in kids:
+            os.kill(int(k), signal.SIGUSR2)
+        time.sleep(3)
+        assert p.poll() is None and all(subprocess.run(["kill", "-0", k]).returncode == 0 for k in kids)
+        n0 = max(m.get("step", 0) for m in metrics(runs, name))
+        time.sleep(4)
+        assert max(m.get("step", 0) for m in metrics(runs, name)) > n0          # still training
+        os.killpg(p.pid, signal.SIGTERM)
+        out, _ = p.communicate(timeout=120)
+    finally:
+        if p.poll() is None:
+            os.killpg(p.pid, signal.SIGKILL)
+    assert "Current thread" in out or "Thread 0x" in out, out[-1500:]           # faulthandler stack dump
+    assert "preempted: saved step" in out
