@@ -169,7 +169,7 @@ def export_final(model, path: str | os.PathLike, dtype=torch.bfloat16, group=Non
     if not dist.is_initialized() or dist.get_rank(group) == 0:
         try:
             torch.save({k: (v.to(dtype) if v.is_floating_point() else v) for k, v in sd.items()}, path)
-        except OSError as e:  # e.g. ENOSPC: tell every rank so they all raise together instead of hanging
+        except (OSError, RuntimeError) as e:  # torch.save raises RuntimeError (PyTorchStreamWriter) for open/ENOSPC; tell every rank so they all raise together instead of hanging
             err = repr(e)
     if dist.is_initialized():
         objs = [err]

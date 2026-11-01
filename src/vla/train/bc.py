@@ -346,7 +346,7 @@ def main():
         if cfg.export_final and engine is None:
             try:
                 export_final(model, run / "final.pt")
-            except OSError as e:  # home quota full: keep the weights somewhere that works
+            except (OSError, RuntimeError) as e:  # home quota full: keep the weights somewhere that works
                 alt = Path(ckpt_dir).parent / "final.pt"
                 say(f"!!! final.pt export to {run} failed ({e}); retrying at {alt}")
                 export_final(model, alt)
