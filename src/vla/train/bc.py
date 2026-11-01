@@ -17,6 +17,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
@@ -72,6 +73,11 @@ class BCConfig:
     prefetch_factor: int = 4
     pin_memory: bool = True
     profile: bool = False               # torch.profiler: 5 warmup + 3 traced steps -> <run>/trace_rank<r>.json, then exit
+    ground_weight: float = 0.0          # >0: aux target-xy grounding loss at the last prefix token (see docs/PLAN_v2_grounding.md)
+    early_k: int = 4                    # frames with t < early_k ...
+    early_w: int = 1                    # ... are repeated early_w times per epoch (1 = off; grounding configs use 3)
+    stop_at: int = 0                    # >0: save DCP ckpt + export stop_<step>.pt at this step and exit 0 (gate runs)
+    keep_best: bool = True              # export best.pt whenever val main_loss improves
     exit_after_step: int = 0            # test aid: hard-exit (like kill -9, no save/flush) after this step
 
 
@@ -130,7 +136,8 @@ def main():
     log = MetricsLogger(run, enabled=rank == 0)
     preempt = PreemptFlag()
 
-    mcfg = load_config(VLAConfig, cfg.model_config, [f"head={cfg.head}"] if cfg.head else [])
+    mov = ([f"head={cfg.head}"] if cfg.head else []) + ([f"ground_weight={cfg.ground_weight}"] if cfg.ground_weight > 0 else [])
+    mcfg = load_config(VLAConfig, cfg.model_config, mov)
     torch.manual_seed(cfg.seed)  # identical init on all ranks (FSDP2 shards from rank-consistent full params)
     model = VLA(mcfg)
     tok = model.tokenizer
@@ -177,7 +184,8 @@ def main():
     assert cfg.global_batch % (cfg.micro_batch * world) == 0, "global_batch must divide by micro_batch*world"
     accum = cfg.global_batch // (cfg.micro_batch * world)
     per_rank_step = cfg.micro_batch * accum
-    sampler = ResumableDistributedSampler(len(ds), rank, world, seed=cfg.seed)
+    repeats = np.where(ds.frame_t < cfg.early_k, cfg.early_w, 1) if cfg.early_w > 1 else None  # None = old behaviour
+    sampler = ResumableDistributedSampler(len(ds), rank, world, seed=cfg.seed, repeats=repeats)
     steps_per_epoch = sampler.num_per_rank // per_rank_step
     total = cfg.steps or int(cfg.epochs * steps_per_epoch)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: lr_at(s, total, cfg.warmup))
@@ -193,39 +201,64 @@ def main():
               f"micro={cfg.micro_batch} accum={accum} global={cfg.global_batch} params={count_params(base)['total']/1e6:.1f}M",
               flush=True)
 
-    step, epoch, in_epoch = 0, 0, 0
+    step, epoch, in_epoch, best_val = 0, 0, 0, float("inf")
     if a.resume:
-        ex = ckpt.load_latest(model, opt, {"step": 0, "epoch": 0, "in_epoch": 0, "sched": sched.state_dict()})
+        ex = ckpt.load_latest(model, opt, {"step": 0, "epoch": 0, "in_epoch": 0, "sched": sched.state_dict(),
+                                           "best_val": float("inf")})
         if ex is not None:
-            step, epoch, in_epoch = ex["step"], ex["epoch"], ex["in_epoch"]
+            step, epoch, in_epoch, best_val = ex["step"], ex["epoch"], ex["in_epoch"], ex["best_val"]
             sched.load_state_dict(ex["sched"])
             if rank == 0:
                 say(f"resume_from={step}", flush=True)
                 log.log(step, {"event_resume_from": step})
 
+    g_std_t = torch.tensor(ds.g_std, device=device) if cfg.ground_weight > 0 else None
+
     def to_dev(b):
-        return {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v) for k, v in b.items()}
+        out = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v) for k, v in b.items()}
+        if g_std_t is not None:
+            out["ground_std"] = g_std_t  # de-normalises the grounding error to metres
+        return out
 
     def extra():
-        return {"step": step, "epoch": epoch, "in_epoch": in_epoch, "sched": sched.state_dict(),
+        return {"step": step, "epoch": epoch, "in_epoch": in_epoch, "sched": sched.state_dict(), "best_val": best_val,
                 "sampler": sampler.state_dict(consumed=in_epoch * per_rank_step)}
 
     def validate() -> dict:
         model.eval()
         vs = ResumableDistributedSampler(len(val_ds), rank, world, seed=0, shuffle=False)
         dl = DataLoader(val_ds, batch_size=cfg.micro_batch, sampler=vs, collate_fn=collate, num_workers=0)
-        tot = torch.zeros(3, device=device)
+        z = torch.zeros((), device=device)
+        tot = torch.zeros(6, device=device)  # loss, tok_acc, main_loss, ground_loss, ground_err_cm, batches
         with torch.no_grad():
             for i, b in enumerate(dl):
                 if i >= cfg.val_batches:
                     break
                 torch.manual_seed(12345 + i)
                 out = model(to_dev(b))
-                tot += torch.tensor([out["loss"].item(), out.get("tok_acc", torch.zeros(())).item(), 1.0], device=device)
+                tot += torch.stack([out["loss"].detach(), out.get("tok_acc", z).detach(), out["main_loss"].detach(),
+                                    out.get("ground_loss", z).detach(), out.get("ground_err_cm", z).detach(),
+                                    torch.ones((), device=device)])
+            # early frames only (t < early_k): where the colour decides the heading
+            t0 = torch.zeros(2, device=device)
+            if cfg.ground_weight > 0:
+                idx0 = np.nonzero(val_ds.frame_t < cfg.early_k)[0][rank::world].tolist()
+                dl0 = DataLoader(val_ds, batch_size=cfg.micro_batch, sampler=idx0, collate_fn=collate, num_workers=0)
+                for i, b in enumerate(dl0):
+                    if i >= cfg.val_batches:
+                        break
+                    torch.manual_seed(54321 + i)
+                    t0 += torch.stack([model(to_dev(b)).get("ground_err_cm", z).detach(), torch.ones((), device=device)])
         if dist.is_initialized():
             dist.all_reduce(tot)
+            dist.all_reduce(t0)
         model.train()
-        return {"val_loss": (tot[0] / tot[2]).item(), "val_tok_acc": (tot[1] / tot[2]).item()}
+        n = tot[5].clamp(min=1)
+        r = {"val_loss": (tot[0] / n).item(), "val_tok_acc": (tot[1] / n).item(), "val_main_loss": (tot[2] / n).item()}
+        if cfg.ground_weight > 0:
+            r.update({"val_ground_loss": (tot[3] / n).item(), "val_ground_err_cm": (tot[4] / n).item(),
+                      "val_ground_err_cm_t0": (t0[0] / t0[1].clamp(min=1)).item()})
+        return r
 
     prof = None
     if cfg.profile:
@@ -256,6 +289,7 @@ def main():
                 faulthandler.dump_traceback_later(cfg.hang_dump_s, repeat=False, file=sys.stdout)
             loss_acc = torch.zeros((), device=device)
             acc_acc = torch.zeros((), device=device)
+            aux = {k: torch.zeros((), device=device) for k in ("main_loss", "ground_loss", "ground_err_cm")}
             data_wait = 0.0
             for mb in range(accum):
                 t_d = time.perf_counter()
@@ -274,6 +308,9 @@ def main():
                     (out["loss"] / accum).backward()
                 loss_acc += out["loss"].detach() / accum  # tensors: no host sync per micro-batch
                 acc_acc += out.get("tok_acc", torch.zeros((), device=device)).detach() / accum
+                for k in aux:
+                    if k in out:
+                        aux[k] += out[k].detach() / accum
             if flops_s is None:
                 n_img = (mcfg.image_size // 16) ** 2 if not mcfg.tiny else (mcfg.image_size // 16) ** 2
                 flops_s = flops_per_sample(base, n_img + 1 + b["input_ids"].shape[1] + base.n_act_tokens)
@@ -300,7 +337,7 @@ def main():
                 stall = ckpt.save(step, model, opt, extra())
                 err.write(f"[rank {rank}] step {step} save staged ({stall:.2f}s) host_mem {host_mem()}\n")
             if step % cfg.log_every == 0 or step == total:
-                m = torch.stack([loss_acc, acc_acc])
+                m = torch.stack([loss_acc, acc_acc, aux["main_loss"], aux["ground_loss"], aux["ground_err_cm"]])
                 if dist.is_initialized():
                     dist.all_reduce(m)
                     m /= world
@@ -310,13 +347,22 @@ def main():
                     dist.all_gather(mems, mem)
                 else:
                     mems = [mem]
-                rec = {"loss": m[0].item(), "tok_acc": m[1].item(), "grad_norm": float(gn), "step_time": dt,
+                rec = {"loss": m[0].item(), "tok_acc": m[1].item(), "main_loss": m[2].item(), "grad_norm": float(gn), "step_time": dt,
                        "samples_per_s": cfg.global_batch / dt, "lr": opt.param_groups[0]["lr"], "epoch": epoch,
                        "mfu": flops_s * cfg.global_batch / dt / (world * cfg.peak_tflops * 1e12),
                        "mem_alloc_gb_per_rank": [x.item() for x in mems], "ckpt_stall_s": stall,
                        "data_wait_s": data_wait, "compute_s": dt - data_wait, **host_mem()}
+                if cfg.ground_weight > 0:
+                    rec.update({"ground_loss": m[3].item(), "ground_err_cm": m[4].item()})
                 if step % cfg.val_every == 0 and len(val_ds):
                     rec.update(validate())
+                    if cfg.keep_best and rec["val_main_loss"] < best_val:
+                        best_val = rec["val_main_loss"]
+                        try:
+                            export_final(model, run / "best.pt")  # collective: val metrics are all-reduced, so all ranks agree
+                            say(f"best.pt updated at step {step}: val_main_loss {best_val:.4f}")
+                        except (OSError, RuntimeError) as e:
+                            say(f"!!! best.pt export failed: {e}")
                 log.log(step, rec)
                 if rank == 0:
                     say(f"step {step}/{total} loss {rec['loss']:.4f} acc {rec['tok_acc']:.3f} "
@@ -329,6 +375,16 @@ def main():
                         say(f"profile written: {run}/trace_rank0.json", flush=True)
                     stop = True
                     break
+            if cfg.stop_at and step == cfg.stop_at:
+                ckpt.save(step, model, opt, extra())
+                ckpt.wait()
+                try:
+                    export_final(model, run / f"stop_{step}.pt")
+                except (OSError, RuntimeError) as e:
+                    say(f"!!! stop_{step}.pt export failed: {e}")
+                say(f"stop_at={cfg.stop_at}: saved ckpt + stop_{step}.pt, exiting (resume with --resume and the same steps)")
+                stop = True
+                break
             if preempt.should_stop(device):
                 ckpt.save(step, model, opt, extra())
                 ckpt.wait()

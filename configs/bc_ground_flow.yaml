@@ -1,0 +1,28 @@
+name: bc_gflow
+model_config: configs/model_0p5b.yaml
+head: flow
+backend: fsdp
+global_batch: 256
+micro_batch: 32        # per GPU (mb16 used 8.6 GB/rank); accum = 256/(mb*world). GPU0 is memory-tight: cap ~20 GB
+steps: 1200            # total (cosine schedule); gate = stop_at=500 then --resume with the same steps
+lr: 1.0e-4
+lr_vision: 1.0e-5
+warmup: 200
+bf16: true
+ckpt_every: 100
+ckpt_mode: async
+ckpt_keep: 2
+num_workers: 2   # data_wait_s ~0.001 at 8; fewer workers = less host RAM (32 procs x torch import)
+prefetch_factor: 4
+pg_timeout_min: 10
+hang_dump_s: 180      # dump all thread stacks to stdout if one step takes >3 min
+# throughput defaults from the 4-GPU sweep (baseline 137 -> 194 samples/s, 1.42x): regional compile + no reshard + prefetch
+compile_layers: true
+reshard_after_forward: false
+prefetch: true
+# colour-grounding recipe (docs/PLAN_v2_grounding.md)
+ground_weight: 0.01
+early_k: 4
+early_w: 3
+val_every: 250
+keep_best: true
