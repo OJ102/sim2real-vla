@@ -1,0 +1,4 @@
+vision_name: google/siglip-base-patch16-224
+llm_name: Qwen/Qwen2.5-1.5B
+head: discrete
+attn_impl: sdpa

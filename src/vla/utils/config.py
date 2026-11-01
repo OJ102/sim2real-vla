@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import dataclasses
+import typing
 from typing import Any, TypeVar
 
 import yaml
@@ -21,12 +22,13 @@ def _coerce(raw: str) -> Any:
 
 def _build(cls: type[T], data: dict) -> T:
     hints = {f.name: f for f in dataclasses.fields(cls)}
+    types = typing.get_type_hints(cls)  # resolves string annotations (from __future__ import annotations)
     unknown = set(data) - set(hints)
     if unknown:
         raise KeyError(f"unknown config keys for {cls.__name__}: {sorted(unknown)}")
     kwargs = {}
     for k, v in data.items():
-        t = hints[k].type
+        t = types[k]
         if isinstance(t, type) and dataclasses.is_dataclass(t) and isinstance(v, dict):
             v = _build(t, v)
         kwargs[k] = v

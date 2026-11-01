@@ -1,0 +1,5 @@
+tiny: true
+head: discrete
+attn_impl: eager
+image_size: 64
+flow: {dim: 64, layers: 2, heads: 4, steps: 4}
