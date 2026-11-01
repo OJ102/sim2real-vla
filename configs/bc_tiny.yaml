@@ -1,0 +1,13 @@
+name: bc_tiny
+model_config: configs/model_tiny.yaml
+backend: fsdp
+global_batch: 8
+micro_batch: 2
+steps: 20
+warmup: 5
+num_workers: 0
+log_every: 5
+val_every: 10
+val_batches: 2
+ckpt_every: 10
+export_final: true

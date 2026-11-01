@@ -152,7 +152,8 @@ class VLA(nn.Module):
         prefix, mask = self.embed_prefix(batch)
         P = prefix.shape[1]
         if self.cfg.head == "flow":
-            h = self.llm.model(inputs_embeds=prefix, attention_mask=mask, position_ids=self._pos(mask)).last_hidden_state
+            h = self.llm.model(inputs_embeds=prefix, attention_mask=mask, position_ids=self._pos(mask),
+                               use_cache=False).last_hidden_state
             loss = flow_loss(self.dit, batch["actions"].to(h.dtype), batch["proprio"].to(h.dtype), h, mask)
             return {"loss": loss}
         bins = self.act_tok.encode_bins(batch["actions"].reshape(batch["actions"].shape[0], -1))  # [B,16]
@@ -167,7 +168,8 @@ class VLA(nn.Module):
         a_emb = self.llm.get_input_embeddings()(bins + self.act_base)
         x = torch.cat([prefix, a_emb[:, :-1]], dim=1)
         m = torch.cat([mask, torch.ones(x.shape[0], self.n_act_tokens - 1, dtype=mask.dtype, device=mask.device)], 1)
-        h = self.llm.model(inputs_embeds=x, attention_mask=m, position_ids=self._pos(m)).last_hidden_state
+        h = self.llm.model(inputs_embeds=x, attention_mask=m, position_ids=self._pos(m),
+                           use_cache=False).last_hidden_state
         return self.act_head(h[:, P - 1:P - 1 + self.n_act_tokens]).float()
 
     def token_logprobs(self, batch: dict, bins: torch.Tensor) -> torch.Tensor:
