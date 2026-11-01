@@ -156,14 +156,25 @@ class VLA(nn.Module):
             loss = flow_loss(self.dit, batch["actions"].to(h.dtype), batch["proprio"].to(h.dtype), h, mask)
             return {"loss": loss}
         bins = self.act_tok.encode_bins(batch["actions"].reshape(batch["actions"].shape[0], -1))  # [B,16]
+        logits = self._discrete_logits(prefix, mask, bins)
+        loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), bins.reshape(-1))
+        acc = (logits.argmax(-1) == bins).float().mean()
+        return {"loss": loss, "tok_acc": acc}
+
+    def _discrete_logits(self, prefix, mask, bins) -> torch.Tensor:
+        """Teacher-forced logits over the action rows: [B, n_act_tokens, n_bins] (float32)."""
+        P = prefix.shape[1]
         a_emb = self.llm.get_input_embeddings()(bins + self.act_base)
         x = torch.cat([prefix, a_emb[:, :-1]], dim=1)
         m = torch.cat([mask, torch.ones(x.shape[0], self.n_act_tokens - 1, dtype=mask.dtype, device=mask.device)], 1)
         h = self.llm.model(inputs_embeds=x, attention_mask=m, position_ids=self._pos(m)).last_hidden_state
-        logits = self.act_head(h[:, P - 1:P - 1 + self.n_act_tokens]).float()
-        loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), bins.reshape(-1))
-        acc = (logits.argmax(-1) == bins).float().mean()
-        return {"loss": loss, "tok_acc": acc}
+        return self.act_head(h[:, P - 1:P - 1 + self.n_act_tokens]).float()
+
+    def token_logprobs(self, batch: dict, bins: torch.Tensor) -> torch.Tensor:
+        """Per-token log pi(bin | prefix, previous bins) over the action vocabulary: [B, n_act_tokens]."""
+        prefix, mask = self.embed_prefix(batch)
+        logp = F.log_softmax(self._discrete_logits(prefix, mask, bins), dim=-1)
+        return logp.gather(-1, bins[..., None]).squeeze(-1)
 
     # ------------------------------------------------------------------ inference
     @torch.no_grad()
