@@ -2,8 +2,8 @@
 __pycache__/
 *.pyc
 .env
-data/
-runs/
+/data/
+/runs/
 *.h5
 *.pt
 .pytest_cache/
