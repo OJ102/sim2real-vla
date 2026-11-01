@@ -22,7 +22,10 @@ dependencies = [
 gpu = ["deepspeed"]
 
 [dependency-groups]
-dev = ["pytest"]  # installed by plain `uv sync`
+dev = [
+    "matplotlib>=3.11.2",
+    "pytest",
+]  # installed by plain `uv sync`
 
 [build-system]
 requires = ["hatchling"]
