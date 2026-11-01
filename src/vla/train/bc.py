@@ -261,7 +261,8 @@ def main():
             # early frames only (t < early_k): where the colour decides the heading
             t0 = torch.zeros(2, device=device)
             if cfg.ground_weight > 0:
-                idx0 = np.nonzero(val_ds.frame_t == 0)[0][rank::world].tolist()  # exactly t == 0
+                idx0 = np.nonzero(val_ds.frame_t == 0)[0]  # exactly t == 0
+                idx0 = idx0[: len(idx0) // world * world][rank::world].tolist()  # equal count per rank: FSDP forwards are collectives
                 dl0 = DataLoader(val_ds, batch_size=cfg.micro_batch, sampler=idx0, collate_fn=collate, num_workers=0)
                 for i, b in enumerate(dl0):
                     if i >= cfg.val_batches:
