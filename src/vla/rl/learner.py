@@ -72,7 +72,7 @@ def learner_loop(cfg, roles, rank, device, model, ref, learner_pg, sync_pg, shm:
     def mk(batch_np, idx):
         b = {"image": torch.from_numpy(batch_np["image"][idx]).to(device),
              "proprio": torch.from_numpy(batch_np["proprio"][idx]).to(device),
-             "bins": torch.from_numpy(batch_np["bins"][idx]).to(device),
+             "bins": torch.from_numpy(batch_np["bins"][idx]).to(device), "temperature": cfg.temperature,
              **{k: v.to(device) for k, v in encode_instructions(tok, [batch_np["instr"][i] for i in idx]).items()}}
         return b
 
@@ -97,7 +97,7 @@ def learner_loop(cfg, roles, rank, device, model, ref, learner_pg, sync_pg, shm:
             for s in range(0, len(mine), cfg.micro_batch):
                 b = mk(data, mine[s:s + cfg.micro_batch])
                 lp_old.append(model(b)["logp"].float())
-                lp_ref.append(ref.token_logprobs(b, b["bins"]).float())
+                lp_ref.append(ref.token_logprobs(b, b["bins"], cfg.temperature).float())
             model.train()
         lp_old, lp_ref = torch.cat(lp_old), torch.cat(lp_ref)
         beh = torch.from_numpy(data["logp"][mine]).to(device)
