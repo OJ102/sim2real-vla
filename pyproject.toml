@@ -20,7 +20,9 @@ dependencies = [
 # Remote server only. Local `uv sync` does not install extras.
 # flash-attn is NOT listed: no source build under nvcc 13.2; setup.sh installs a prebuilt wheel if one matches.
 gpu = ["deepspeed"]
-dev = ["pytest"]
+
+[dependency-groups]
+dev = ["pytest"]  # installed by plain `uv sync`
 
 [build-system]
 requires = ["hatchling"]

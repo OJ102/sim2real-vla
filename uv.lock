@@ -1282,11 +1282,13 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-dev = [
-    { name = "pytest" },
-]
 gpu = [
     { name = "deepspeed" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
 ]
 
 [package.metadata]
@@ -1297,7 +1299,6 @@ requires-dist = [
     { name = "imageio", extras = ["ffmpeg"] },
     { name = "mujoco", specifier = ">=3.2" },
     { name = "numpy" },
-    { name = "pytest", marker = "extra == 'dev'" },
     { name = "pyyaml" },
     { name = "robot-descriptions" },
     { name = "tensorboard" },
@@ -1305,7 +1306,10 @@ requires-dist = [
     { name = "torch", marker = "sys_platform == 'linux'", specifier = ">=2.6,<2.15", index = "https://download.pytorch.org/whl/cu130" },
     { name = "transformers", specifier = ">=4.46" },
 ]
-provides-extras = ["gpu", "dev"]
+provides-extras = ["gpu"]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest" }]
 
 [[package]]
 name = "websockets"
