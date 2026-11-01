@@ -9,3 +9,4 @@ runs/
 .pytest_cache/
 results/demo/*.gif
 runs_pulled/
+MUJOCO_LOG.TXT
