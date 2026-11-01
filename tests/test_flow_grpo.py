@@ -184,8 +184,17 @@ def test_flow_engine_greedy_is_deterministic_ode():
     m = flow_model(); b = fbatch(m)
     e = make_engine(m, flow_K=3, sde_a=0.7)
     assert isinstance(e, FlowEngine)
-    a1, a2 = e.generate(b, greedy=True)["actions"], e.generate(b, greedy=True)["actions"]
-    assert torch.equal(a1, a2) and a1.shape == (3, 4, 4) and a1.abs().max() <= 1
+    a1 = e.generate(b, greedy=True)["actions"]
+    assert a1.shape == (3, 4, 4) and a1.abs().max() <= 1
+    # greedy = ODE from *random* noise (not seeded): same noise -> same actions through the sampler used by greedy
+    from vla.model.flow_head import euler_sample
+    noise = torch.randn(3, 4, 4, generator=torch.Generator().manual_seed(0))
+    with torch.no_grad():
+        prefix, mask = m.embed_prefix(b)
+        h = m.llm.model(inputs_embeds=prefix, attention_mask=mask, position_ids=m._pos(mask)).last_hidden_state
+        o1 = euler_sample(m.dit, b["proprio"], h, mask, m.cfg.flow.steps, noise=noise)
+        o2 = euler_sample(m.dit, b["proprio"], h, mask, m.cfg.flow.steps, noise=noise)
+    assert torch.equal(o1, o2)
     s1 = e.generate(b, generator=torch.Generator().manual_seed(1)); s2 = e.generate(b, generator=torch.Generator().manual_seed(1))
     assert torch.equal(s1["x_next"], s2["x_next"])
 

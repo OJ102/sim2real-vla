@@ -341,7 +341,8 @@ def test_sigusr2_dumps_stacks_and_does_not_kill(demos, runs):
     finally:
         if p.poll() is None:
             os.killpg(p.pid, signal.SIGKILL)
-    assert "Current thread" in out or "Thread 0x" in out, out[-1500:]           # faulthandler stack dump
+    errs = "".join((Path(runs) / name / f"rank{r}.err").read_text() for r in (0, 1))   # dumps go to the per-rank err files
+    assert "Current thread" in errs or "Thread 0x" in errs, errs[-1500:]
     assert "preempted: saved step" in out
 
 

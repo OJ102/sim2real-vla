@@ -14,6 +14,8 @@ position ids = (#valid prefix tokens) + i.
 """
 from __future__ import annotations
 
+import warnings
+
 import torch
 import torch.nn.functional as F
 
@@ -90,12 +92,14 @@ class InferenceEngine:
 
     def _decoder(self, B: int, prefix_len: int, device, dtype) -> _StaticDecoder:
         mp = self.max_prefix or prefix_len
-        if self.max_prefix is None and B in self._dec and self._dec[B].max_len - self.model.n_act_tokens < prefix_len:
-            del self._dec[B]  # prompt longer than first seen: reallocate (graph recaptured)
+        n = self.model.n_act_tokens
+        if B in self._dec and self._dec[B].max_len - n < prefix_len:
+            # a prompt longer than the preallocated budget must never crash a rollout: reallocate (graph is recaptured)
+            warnings.warn(f"prefix length {prefix_len} > max_prefix {self._dec[B].max_len - n}: reallocating the static "
+                          f"cache for batch {B}" + (" and recapturing the CUDA graph" if self.mode == "graph" else ""))
+            del self._dec[B]
         if B not in self._dec:
-            self._dec[B] = _StaticDecoder(self.model, B, max(mp, prefix_len) + self.model.n_act_tokens, device, dtype)
-            if self.mode == "graph":
-                self._capture_pending = True
+            self._dec[B] = _StaticDecoder(self.model, B, max(mp, prefix_len) + n, device, dtype)
         return self._dec[B]
 
     def _pick(self, logits: torch.Tensor, greedy: bool, generator):
