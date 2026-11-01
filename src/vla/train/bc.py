@@ -12,6 +12,7 @@ import argparse
 import contextlib
 import math
 import os
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -63,6 +64,11 @@ class BCConfig:
     ckpt_dir: str = ""                  # default <run>/ckpt
     peak_tflops: float = 312.0          # A100 bf16
     export_final: bool = True
+    pg_timeout_min: float = 10.0        # explicit timeout on every process group (hangs raise instead of sitting)
+    hang_dump_s: float = 0.0            # >0: dump all thread stacks to stdout if a step takes longer (also SIGUSR2)
+    ckpt_slow_s: float = 0.0            # test aid: slow DCP writer (reproduces async-overlap bugs on CPU)
+    prefetch_factor: int = 4
+    pin_memory: bool = True
     profile: bool = False               # torch.profiler: 5 warmup + 3 traced steps -> <run>/trace_rank<r>.json, then exit
     exit_after_step: int = 0            # test aid: hard-exit (like kill -9, no save/flush) after this step
 
@@ -88,8 +94,14 @@ def main():
     ap.add_argument("overrides", nargs="*")
     a = ap.parse_args()
     cfg = load_config(BCConfig, a.config, a.overrides)
-    rank, world, local, device = init_dist()
+    rank, world, local, device = init_dist(cfg.pg_timeout_min)
+    if cfg.hang_dump_s or True:
+        import faulthandler
+        import signal as _sig
+
+        faulthandler.register(_sig.SIGUSR2, all_threads=True)  # kill -USR2 <pid> prints every thread's stack
     cuda = device.type == "cuda"
+    torch.set_float32_matmul_precision("high")
     run = Path(cfg.runs_dir or os.environ.get("VLA_RUNS", "runs")) / cfg.name
     data_dir = cfg.data_dir or str(Path(os.environ["VLA_DATA"]) / "demos")
     if rank == 0:
@@ -147,7 +159,8 @@ def main():
     steps_per_epoch = sampler.num_per_rank // per_rank_step
     total = cfg.steps or int(cfg.epochs * steps_per_epoch)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: lr_at(s, total, cfg.warmup))
-    ckpt = Checkpointer(cfg.ckpt_dir or run / "ckpt", cfg.ckpt_mode, cfg.ckpt_keep, cfg.ckpt_mirror or None)
+    ckpt = Checkpointer(cfg.ckpt_dir or run / "ckpt", cfg.ckpt_mode, cfg.ckpt_keep, cfg.ckpt_mirror or None,
+                        cfg.pg_timeout_min, cfg.ckpt_slow_s)
     if rank == 0:
         print(f"world={world} backend={cfg.backend} frames={len(ds)} steps/epoch={steps_per_epoch} total={total} "
               f"micro={cfg.micro_batch} accum={accum} global={cfg.global_batch} params={count_params(base)['total']/1e6:.1f}M",
@@ -202,27 +215,38 @@ def main():
         sampler.set_epoch(epoch)
         sampler.consumed = in_epoch * per_rank_step
         dl = DataLoader(ds, batch_size=cfg.micro_batch, sampler=sampler, collate_fn=collate,
-                        num_workers=cfg.num_workers, drop_last=True, persistent_workers=False)
+                        num_workers=cfg.num_workers, drop_last=True, persistent_workers=False,
+                        pin_memory=cuda and cfg.pin_memory,
+                        prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None)
         it = iter(dl)
         while in_epoch < steps_per_epoch and step < total:
             t0 = time.perf_counter()
             torch.manual_seed(cfg.seed * 1_000_003 + step * world + rank)  # deterministic per step, resume-safe
-            loss_acc = acc_acc = 0.0
+            if cfg.hang_dump_s:
+                import faulthandler
+
+                faulthandler.cancel_dump_traceback_later()
+                faulthandler.dump_traceback_later(cfg.hang_dump_s, repeat=False, file=sys.stdout)
+            loss_acc = torch.zeros((), device=device)
+            acc_acc = torch.zeros((), device=device)
+            data_wait = 0.0
             for mb in range(accum):
+                t_d = time.perf_counter()
                 b = to_dev(next(it))
+                data_wait += time.perf_counter() - t_d
                 ctx = model.no_sync() if (cfg.backend == "ddp" and mb < accum - 1) else contextlib.nullcontext()
                 if engine is not None:  # DeepSpeed: engine owns scaling/accumulation/clipping/optimizer step
                     out = model(b)
                     model.backward(out["loss"])
                     model.step()
-                    loss_acc += out["loss"].item() / accum
+                    loss_acc += out["loss"].detach() / accum
                     continue
                 with ctx, (torch.autocast("cuda", dtype=torch.bfloat16) if (cuda and cfg.backend == "ddp" and cfg.bf16)
                            else contextlib.nullcontext()):
                     out = model(b)
                     (out["loss"] / accum).backward()
-                loss_acc += out["loss"].item() / accum
-                acc_acc += out.get("tok_acc", torch.zeros(())).item() / accum
+                loss_acc += out["loss"].detach() / accum  # tensors: no host sync per micro-batch
+                acc_acc += out.get("tok_acc", torch.zeros((), device=device)).detach() / accum
             if flops_s is None:
                 n_img = (mcfg.image_size // 16) ** 2 if not mcfg.tiny else (mcfg.image_size // 16) ** 2
                 flops_s = flops_per_sample(base, n_img + 1 + b["input_ids"].shape[1] + base.n_act_tokens)
@@ -247,7 +271,7 @@ def main():
             if step % cfg.ckpt_every == 0 and engine is None:
                 stall = ckpt.save(step, model, opt, extra())
             if step % cfg.log_every == 0 or step == total:
-                m = torch.tensor([loss_acc, acc_acc], device=device)
+                m = torch.stack([loss_acc, acc_acc])
                 if dist.is_initialized():
                     dist.all_reduce(m)
                     m /= world
@@ -260,7 +284,8 @@ def main():
                 rec = {"loss": m[0].item(), "tok_acc": m[1].item(), "grad_norm": float(gn), "step_time": dt,
                        "samples_per_s": cfg.global_batch / dt, "lr": opt.param_groups[0]["lr"], "epoch": epoch,
                        "mfu": flops_s * cfg.global_batch / dt / (world * cfg.peak_tflops * 1e12),
-                       "mem_alloc_gb_per_rank": [x.item() for x in mems], "ckpt_stall_s": stall}
+                       "mem_alloc_gb_per_rank": [x.item() for x in mems], "ckpt_stall_s": stall,
+                       "data_wait_s": data_wait, "compute_s": dt - data_wait}
                 if step % cfg.val_every == 0 and len(val_ds):
                     rec.update(validate())
                 log.log(step, rec)

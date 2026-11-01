@@ -3,7 +3,7 @@ model_config: configs/model_0p5b.yaml
 head: discrete
 backend: fsdp
 global_batch: 256
-micro_batch: 16        # per GPU; shared GPUs: keep memory small, grad_accum fills the rest
+micro_batch: 32        # per GPU (mb16 used 8.6 GB/rank); accum = 256/(mb*world). GPU0 is memory-tight: cap ~20 GB
 epochs: 8
 lr: 1.0e-4
 lr_vision: 1.0e-5
@@ -12,3 +12,7 @@ bf16: true
 ckpt_every: 100
 ckpt_mode: async
 ckpt_keep: 2
+num_workers: 8
+prefetch_factor: 4
+pg_timeout_min: 10
+hang_dump_s: 180      # dump all thread stacks to stdout if one step takes >3 min

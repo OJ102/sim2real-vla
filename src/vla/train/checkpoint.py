@@ -11,6 +11,7 @@ import shutil
 import signal
 import subprocess
 import time
+from datetime import timedelta
 from pathlib import Path
 
 import torch
@@ -23,15 +24,42 @@ def step_name(step: int) -> str:
     return f"step_{step:06d}"
 
 
+class SlowWriter(dcp.FileSystemWriter):
+    """Test aid: DCP writer that sleeps before writing, to force long overlap between an in-flight async save and the
+    training loop (reproduces collective-ordering bugs on CPU)."""
+
+    def __init__(self, path, delay_s: float, **kw):
+        super().__init__(path, **kw)
+        self.delay_s = delay_s
+
+    def prepare_local_plan(self, plan):
+        # stagger ranks so DCP's planning collectives are issued at different times on different ranks
+        if dist.get_rank() == dist.get_world_size() - 1:
+            time.sleep(self.delay_s)
+        return super().prepare_local_plan(plan)
+
+    def write_data(self, plan, planner):
+        time.sleep(self.delay_s)
+        return super().write_data(plan, planner)
+
+
 class Checkpointer:
-    def __init__(self, ckpt_dir: str | os.PathLike, mode: str = "sync", keep: int = 2, mirror_to: str | None = None):
+    def __init__(self, ckpt_dir: str | os.PathLike, mode: str = "sync", keep: int = 2, mirror_to: str | None = None,
+                 timeout_min: float = 10.0, slow_s: float = 0.0, shared_pg_bug: bool = False):
         assert mode in ("sync", "async")
         self.dir, self.mode, self.keep, self.mirror_to = Path(ckpt_dir), mode, keep, mirror_to
         self.rank = dist.get_rank() if dist.is_initialized() else 0
         self.dir.mkdir(parents=True, exist_ok=True)
         self._pending = None  # (future, step)
         # async_save stages to CPU and writes in a thread; it needs a CPU-capable group (gloo) even in nccl runs
-        self._pg = dist.new_group(backend="gloo") if (dist.is_initialized() and mode == "async") else None
+        self.slow_s = slow_s
+        shared_pg_bug = shared_pg_bug or os.environ.get("VLA_CKPT_SHARED_PG") == "1"  # repro of the old deadlock
+        td = timedelta(minutes=timeout_min)
+        # `_pg` is used ONLY by DCP's background save thread. `_ctl` carries our own consensus/barrier collectives
+        # from the main thread: sharing one gloo group between two threads interleaves collectives and deadlocks.
+        self._pg = dist.new_group(backend="gloo", timeout=td) if (dist.is_initialized() and mode == "async") else None
+        self._ctl = self._pg if shared_pg_bug else (
+            dist.new_group(backend="gloo", timeout=td) if (dist.is_initialized() and mode == "async") else None)
         self.last_stall_s = 0.0
 
     # ------------------------------------------------------------------ save
@@ -46,7 +74,8 @@ class Checkpointer:
             dcp.save(state, checkpoint_id=path)
             self._publish(step)
         else:
-            fut = dcp.async_save(state, checkpoint_id=path, process_group=self._pg)
+            kw = {"storage_writer": SlowWriter(path, self.slow_s)} if self.slow_s else {"checkpoint_id": path}
+            fut = dcp.async_save(state, process_group=self._pg, **kw)
             self._pending = (fut, step)
         self.last_stall_s = time.perf_counter() - t0
         return self.last_stall_s
@@ -67,14 +96,14 @@ class Checkpointer:
             # by every rank every step, so this never mismatches the training collectives
             done = torch.tensor([int(fut.done())])
             if dist.is_initialized():
-                dist.all_reduce(done, op=dist.ReduceOp.MIN, group=self._pg)
+                dist.all_reduce(done, op=dist.ReduceOp.MIN, group=self._ctl)
             if not done.item():
                 return
         fut.result()
         self._pending = None
         # every rank must have finished writing before rank 0 publishes
         if dist.is_initialized():
-            dist.barrier(group=self._pg)
+            dist.barrier(group=self._ctl)
         self._publish(step, barrier=False)
 
     def _publish(self, step: int, barrier: bool = True) -> None:
@@ -117,12 +146,20 @@ def export_final(model, path: str | os.PathLike, dtype=torch.bfloat16, group=Non
 
 
 class PreemptFlag:
-    """SIGTERM/SIGUSR1 set a flag; the loop checks it at step boundaries (all ranks agree via all-reduce)."""
+    """SIGTERM/SIGUSR1 set a flag; the loop checks it at step boundaries (all ranks agree via all-reduce).
+    A second signal while the flag is already set (rank stuck in a collective, so the loop never reaches the check)
+    hard-exits with 143."""
 
     def __init__(self):
         self.flag = False
+
+        def handler(*_):
+            if self.flag:
+                os._exit(143)
+            self.flag = True
+
         for s in (signal.SIGTERM, signal.SIGUSR1):
-            signal.signal(s, lambda *_: setattr(self, "flag", True))
+            signal.signal(s, handler)
 
     def should_stop(self, device) -> bool:
         if not dist.is_initialized():

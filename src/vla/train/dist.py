@@ -9,7 +9,7 @@ import torch.distributed as dist
 import torch.nn as nn
 
 
-def init_dist(timeout_min: int = 30):
+def init_dist(timeout_min: float = 10):
     """-> (rank, world, local_rank, device). nccl when CUDA is available, else gloo (CPU smoke tests).
     Works without torchrun (single process, no process group)."""
     cuda = torch.cuda.is_available()

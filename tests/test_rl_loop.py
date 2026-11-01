@@ -65,7 +65,7 @@ def test_s0_artifacts_and_metrics(s0):
         assert x["tis_w_mean"] == pytest.approx(1.0, abs=1e-3) and x["tis_w_max"] < 1.01
         assert x["staleness_hist"] == {"0": x["n_samples"]}
         assert x["engine_mismatch_equal_version"] < 1e-4, x["engine_mismatch_equal_version"]
-    assert rec[0]["sync_latency_ms"] > 0 and rec[1]["sync_latency_ms"] == 0   # last iter: no sync (j < K-S)
+    assert all(x["sync_latency_ms"] > 0 for x in rec)                       # S=0: K-S = 2 syncs, after every update
     # return = sum of components
     for x in rec:
         comp = sum(x[k] for k in x if k.startswith("R_"))
@@ -225,7 +225,6 @@ def test_load_batches_group_advantages(tmp_path):
                 assert np.abs(per_ep).max() == 0 and np.isfinite(per_ep).all()
     assert (data["version"][:n0] == 3).all() and (data["version"][n0:] == 4).all()
     assert np.concatenate(es["ret"]).tolist() == r0 + r1 and metas[0]["env_steps"] == 1
-    assert data["instr"][:2] == ["i0", "i0"][:2] or True
     assert data["instr"][0] == "i0" and data["instr"][n0] == "i0"
 
 
@@ -255,7 +254,6 @@ def test_grpo_loss_gradient_matches_hand_computation():
     loss, m = grpo_loss(tn, t(old), t(beh), t(ref), t(adv))
     loss.backward()
     np.testing.assert_allclose(tn.grad.numpy(), _hand_grad(new, old, beh, ref, advb), atol=1e-9)
-    assert (_hand_grad(new, old, beh, ref, advb) == 0).sum() == 0 or True
     # value check against the hand formula too
     r = np.exp(new - old); w = np.minimum(np.exp(old - beh), 2.0)
     pg = np.minimum(r * advb, np.clip(r, 0.8, 1.2) * advb)
