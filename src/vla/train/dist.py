@@ -33,7 +33,7 @@ def layer_modules(model: nn.Module) -> list[nn.Module]:
 
 
 def wrap_fsdp2(model: nn.Module, bf16: bool = True, reshard_after_forward: bool = True, prefetch: bool = False,
-               act_ckpt: bool = False, mesh=None) -> nn.Module:
+               act_ckpt: bool = False, mesh=None, compile_layers: bool = False) -> nn.Module:
     """fully_shard each block, then the root. bf16 params / fp32 gradient reduction (cast_forward_inputs=False so
     the action targets are not rounded to bf16 before tokenisation)."""
     from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
@@ -50,6 +50,12 @@ def wrap_fsdp2(model: nn.Module, bf16: bool = True, reshard_after_forward: bool 
         mesh = init_device_mesh("cuda" if torch.cuda.is_available() else "cpu", (dist.get_world_size(),))
     kw = {"mesh": mesh, **({"mp_policy": mp} if mp is not None else {})}
     layers = layer_modules(model)
+    if compile_layers:  # regional compile: per block, BEFORE fully_shard (torchtitan recipe)
+        from torch import _dynamo
+
+        _dynamo.config.cache_size_limit = 64  # a handful of distinct prompt lengths -> bounded recompiles
+        for m in layers:
+            m.compile()
     for m in layers:
         fully_shard(m, reshard_after_forward=reshard_after_forward, **kw)
     fully_shard(model, reshard_after_forward=False, **kw)  # root: keep unsharded through backward (last-used params)

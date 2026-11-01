@@ -51,6 +51,8 @@ class BCConfig:
     seed: int = 0
     bf16: bool = True
     act_ckpt: bool = False
+    compile_layers: bool = False        # torch.compile each transformer block before fully_shard (FSDP2 only)
+    fused_adam: bool = True             # fused AdamW kernels (CUDA only)
     reshard_after_forward: bool = True
     prefetch: bool = False
     num_workers: int = 4
@@ -138,7 +140,8 @@ def main():
         model.to(device)
     model.train()
     if cfg.backend == "fsdp":
-        model = wrap_fsdp2(model, cfg.bf16, cfg.reshard_after_forward, cfg.prefetch, cfg.act_ckpt)
+        model = wrap_fsdp2(model, cfg.bf16, cfg.reshard_after_forward, cfg.prefetch, cfg.act_ckpt,
+                           compile_layers=cfg.compile_layers)
     elif cfg.backend == "ddp":
         model = wrap_ddp(model, local, cfg.act_ckpt)
     elif cfg.backend == "deepspeed":
@@ -152,7 +155,8 @@ def main():
     vis = [p for n, p in model.named_parameters() if "vision." in n]
     rest = [p for n, p in model.named_parameters() if "vision." not in n]
     opt = torch.optim.AdamW([{"params": rest, "lr": cfg.lr}, {"params": vis, "lr": cfg.lr_vision}],
-                            weight_decay=cfg.weight_decay, betas=(0.9, 0.95))
+                            weight_decay=cfg.weight_decay, betas=(0.9, 0.95),
+                            fused=bool(cuda and cfg.fused_adam))
 
     engine = None
     if cfg.backend == "deepspeed":
@@ -182,6 +186,8 @@ def main():
                                 else str(run / "ckpt"))
     ckpt = Checkpointer(ckpt_dir, cfg.ckpt_mode, cfg.ckpt_keep, cfg.ckpt_mirror or None,
                         cfg.pg_timeout_min, cfg.ckpt_slow_s, log=say)
+    say(f"attn_implementation: llm={base.llm.config._attn_implementation} "
+        f"vision={base.vision.config._attn_implementation}")
     if rank == 0:
         say(f"world={world} backend={cfg.backend} frames={len(ds)} steps/epoch={steps_per_epoch} total={total} "
               f"micro={cfg.micro_batch} accum={accum} global={cfg.global_batch} params={count_params(base)['total']/1e6:.1f}M",

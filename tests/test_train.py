@@ -344,3 +344,148 @@ def test_sigusr2_dumps_stacks_and_does_not_kill(demos, runs):
             os.killpg(p.pid, signal.SIGKILL)
     assert "Current thread" in out or "Thread 0x" in out, out[-1500:]           # faulthandler stack dump
     assert "preempted: saved step" in out
+
+
+# ------------------------------------------------------------------ robustness: failed saves, VLA_CKPT, diagnostics, launch.sh
+import shutil  # noqa: E402
+
+needs_nonroot = pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="chmod 555 does not block root")
+
+
+@needs_nonroot
+@pytest.mark.parametrize("mode", ["sync", "async"])
+def test_failed_checkpoint_saves_do_not_kill_training(demos, runs, tmp_path, mode):
+    d = tmp_path / "ro_ckpt"
+    d.mkdir()
+    d.chmod(0o555)
+    try:
+        name = f"ro_{mode}"
+        r = run(demos, runs, name, [f"ckpt_dir={d}", "ckpt_every=4", "steps=12", f"ckpt_mode={mode}"])
+        _ok(r)
+        assert "!!! CHECKPOINT SAVE FAILED at step 4" in r.stdout, r.stdout[-1500:]
+        assert not (d / "latest").exists() and not list(d.glob("step_*")) and not list(d.glob("*.tmp"))
+        assert sorted(losses(runs, name)) == [5, 10, 12] or max(losses(runs, name)) == 12
+        assert 12 in losses(runs, name)
+        assert (Path(runs) / name / "final.pt").is_file()
+    finally:
+        d.chmod(0o755)
+
+
+@needs_nonroot
+def test_failed_save_then_recovers_when_dir_becomes_writable(demos, runs, tmp_path):
+    """A failed save leaves no state behind: the next successful save publishes normally (unit, no dist)."""
+    from vla.train.checkpoint import Checkpointer
+
+    m = torch.nn.Linear(4, 4); opt = torch.optim.AdamW(m.parameters())
+    m(torch.randn(2, 4)).sum().backward(); opt.step()
+    d = tmp_path / "c"; ck = Checkpointer(d, "sync", keep=2)
+    d.chmod(0o555)
+    try:
+        ck.save(1, m, opt, {"step": 1})
+        assert ck.latest() is None and ck.n_failed == 1
+    finally:
+        d.chmod(0o755)
+    ck.save(2, m, opt, {"step": 2})
+    assert ck.latest() == "step_000002" and ck.n_failed == 1
+
+
+def test_vla_ckpt_env_redirects_checkpoints(demos, runs, tmp_path, monkeypatch):
+    shm = tmp_path / "shmckpt"
+    monkeypatch.setitem(ENV, "VLA_CKPT", str(shm))
+    try:
+        _ok(run(demos, runs, "envckpt", ["steps=10", "ckpt_every=5"]))
+    finally:
+        ENV.pop("VLA_CKPT", None)
+    assert (shm / "envckpt" / "ckpt" / "latest").read_text().strip() == "step_000010"
+    assert (shm / "envckpt" / "ckpt" / "step_000005").is_dir() or (shm / "envckpt" / "ckpt" / "step_000010").is_dir()
+    assert not (Path(runs) / "envckpt" / "ckpt").exists()
+    assert (Path(runs) / "envckpt" / "final.pt").is_file()
+    # explicit ckpt_dir still wins over $VLA_CKPT
+    monkeypatch.setitem(ENV, "VLA_CKPT", str(shm))
+    try:
+        _ok(run(demos, runs, "envckpt2", ["steps=5", "ckpt_every=5", f"ckpt_dir={tmp_path / 'explicit'}"]))
+    finally:
+        ENV.pop("VLA_CKPT", None)
+    assert (tmp_path / "explicit" / "latest").exists() and not (shm / "envckpt2").exists()
+
+
+def test_rank_err_files_and_host_mem(demos, runs):
+    _ok(run(demos, runs, "errfiles", ["steps=10", "ckpt_every=5", "ckpt_mode=async"]))
+    d = Path(runs) / "errfiles"
+    for r in (0, 1):
+        txt = (d / f"rank{r}.err").read_text()
+        assert f"[rank {r}] pid" in txt and "save start" in txt and "save staged" in txt, txt[-600:]
+    recs = [m for m in metrics(runs, "errfiles") if "loss" in m]
+    if sys.platform.startswith("linux"):
+        assert all("rss_gb" in m for m in recs)
+    # off Linux host_mem() must still return a dict and never raise
+    from vla.utils.logging import host_mem
+    assert isinstance(host_mem(), dict)
+
+
+def test_final_pt_fallback_when_run_dir_unwritable(demos, runs, tmp_path):
+    name = "fallback"
+    (Path(runs) / name).mkdir(parents=True, exist_ok=True)
+    (Path(runs) / name / "final.pt").mkdir()                       # torch.save to a directory path -> OSError on rank 0
+    ck = tmp_path / "ckroot" / "ckpt"
+    r = run(demos, runs, name, [f"ckpt_dir={ck}", "steps=6", "ckpt_every=3"], timeout=300)
+    _ok(r)
+    assert "final.pt export to" in r.stdout and "failed" in r.stdout
+    assert (ck.parent / "final.pt").is_file()
+
+
+def _export_worker(rank, world, init_file, target, expect):
+    import torch.distributed as dist
+
+    from vla.train.checkpoint import export_final
+
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world)
+    try:
+        m = torch.nn.Linear(4, 4)
+        if expect == "oserror":
+            try:
+                export_final(m, target)
+            except OSError:
+                return                                              # every rank must raise, none may hang
+            raise AssertionError(f"rank {rank} did not raise")
+        export_final(m, target)
+    finally:
+        dist.destroy_process_group()
+
+
+@needs_nonroot
+def test_export_final_failure_raises_on_all_ranks_no_hang(tmp_path):
+    import torch.multiprocessing as mp
+
+    ro = tmp_path / "ro"; ro.mkdir(); ro.chmod(0o555)
+    try:
+        ctx = mp.spawn(_export_worker, args=(2, str(tmp_path / "rdzv"), str(ro / "final.pt"), "oserror"), nprocs=2, join=False)
+        t0 = time.time()
+        while not ctx.join(timeout=5) and time.time() - t0 < 120:
+            pass
+        assert time.time() - t0 < 120, "export_final hung on failure"
+    finally:
+        ro.chmod(0o755)
+    mp.spawn(_export_worker, args=(2, str(tmp_path / "rdzv2"), str(tmp_path / "ok.pt"), "ok"), nprocs=2, join=True)
+    assert (tmp_path / "ok.pt").is_file()
+
+
+@pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux not installed")
+def test_launch_sh_keeps_exit_code_and_mirrors_log(tmp_path):
+    import uuid
+
+    name = "t" + uuid.uuid4().hex[:8]
+    env = {**os.environ, "VLA_RUNS": str(tmp_path / "runs"), "VLA_LOGS": str(tmp_path / "logs")}
+    r = subprocess.run(["bash", "scripts/remote/launch.sh", name, "bash", "-c", "echo hi; exit 4"], cwd=ROOT, env=env,
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    a, b = tmp_path / "runs" / name / "stdout.log", tmp_path / "logs" / f"{name}.log"
+    t0 = time.time()
+    while time.time() - t0 < 30 and not (b.exists() and "EXIT=" in b.read_text() and a.exists() and "EXIT=" in a.read_text()):
+        time.sleep(0.3)
+    try:
+        ta, tb = a.read_text(), b.read_text()
+        assert ta.strip().splitlines()[-1].startswith("EXIT=4 ") and tb.strip().splitlines()[-1].startswith("EXIT=4 ")
+        assert ta == tb and "hi" in ta and "=== START" in ta
+    finally:
+        subprocess.run(["tmux", "kill-session", "-t", name], capture_output=True)
