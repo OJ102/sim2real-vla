@@ -26,11 +26,21 @@ class MetricsLogger:
         if not self.enabled:
             return
         rec = {"step": int(step), "time": time.time(), **{k: _py(v) for k, v in metrics.items()}}
-        self._f.write(json.dumps(rec) + "\n")
+        try:
+            self._f.write(json.dumps(rec) + "\n")
+        except OSError as e:  # disk full etc.: never kill training over a metrics write
+            if not getattr(self, "_warned", False):
+                import sys
+
+                print(f"!!! metrics write failed ({e}); further failures silenced", file=sys.stderr, flush=True)
+                self._warned = True
         if self._tb is not None:
-            for k, v in rec.items():
-                if k not in ("step", "time") and isinstance(v, (int, float)):
-                    self._tb.add_scalar(k, v, step)
+            try:
+                for k, v in rec.items():
+                    if k not in ("step", "time") and isinstance(v, (int, float)):
+                        self._tb.add_scalar(k, v, step)
+            except OSError:
+                pass
 
     def close(self) -> None:
         if self._f:

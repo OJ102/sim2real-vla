@@ -17,6 +17,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.api import CheckpointException  # derives from BaseException, not Exception!
 from torch.distributed.checkpoint.state_dict import StateDictOptions, get_state_dict, set_state_dict
 
 
@@ -45,7 +46,7 @@ class SlowWriter(dcp.FileSystemWriter):
 
 class Checkpointer:
     def __init__(self, ckpt_dir: str | os.PathLike, mode: str = "sync", keep: int = 2, mirror_to: str | None = None,
-                 timeout_min: float = 10.0, slow_s: float = 0.0, shared_pg_bug: bool = False):
+                 timeout_min: float = 10.0, slow_s: float = 0.0, shared_pg_bug: bool = False, log=None):
         assert mode in ("sync", "async")
         self.dir, self.mode, self.keep, self.mirror_to = Path(ckpt_dir), mode, keep, mirror_to
         self.rank = dist.get_rank() if dist.is_initialized() else 0
@@ -53,32 +54,55 @@ class Checkpointer:
         self._pending = None  # (future, step)
         # async_save stages to CPU and writes in a thread; it needs a CPU-capable group (gloo) even in nccl runs
         self.slow_s = slow_s
+        self.log = log or (lambda m: print(m, flush=True))
+        self.n_failed = 0
         shared_pg_bug = shared_pg_bug or os.environ.get("VLA_CKPT_SHARED_PG") == "1"  # repro of the old deadlock
         td = timedelta(minutes=timeout_min)
         # `_pg` is used ONLY by DCP's background save thread. `_ctl` carries our own consensus/barrier collectives
         # from the main thread: sharing one gloo group between two threads interleaves collectives and deadlocks.
         self._pg = dist.new_group(backend="gloo", timeout=td) if (dist.is_initialized() and mode == "async") else None
         self._ctl = self._pg if shared_pg_bug else (
-            dist.new_group(backend="gloo", timeout=td) if (dist.is_initialized() and mode == "async") else None)
+            dist.new_group(backend="gloo", timeout=td) if dist.is_initialized() else None)
         self.last_stall_s = 0.0
 
     # ------------------------------------------------------------------ save
     def save(self, step: int, model, optimizer, extra: dict) -> float:
-        """Returns the wall time this call blocked the training loop (the 'stall')."""
+        """Returns the wall time this call blocked the training loop (the 'stall'). A failed save (disk full, I/O
+        error) is logged loudly, never advances `latest`, and never raises: training continues."""
         t0 = time.perf_counter()
         self._finalize_pending(block=True)  # at most one save in flight
-        msd, osd = get_state_dict(model, optimizer)
-        state = {"model": msd, "optim": osd, "extra": extra}
         path = str(self.dir / step_name(step))
-        if self.mode == "sync":
-            dcp.save(state, checkpoint_id=path)
-            self._publish(step)
-        else:
-            kw = {"storage_writer": SlowWriter(path, self.slow_s)} if self.slow_s else {"checkpoint_id": path}
-            fut = dcp.async_save(state, process_group=self._pg, **kw)
-            self._pending = (fut, step)
+        try:
+            msd, osd = get_state_dict(model, optimizer)
+            state = {"model": msd, "optim": osd, "extra": extra}
+            if self.mode == "sync":
+                dcp.save(state, checkpoint_id=path)
+                self._publish_if_all_ok(step, True)
+            else:
+                kw = {"storage_writer": SlowWriter(path, self.slow_s)} if self.slow_s else {"checkpoint_id": path}
+                fut = dcp.async_save(state, process_group=self._pg, **kw)
+                self._pending = (fut, step)
+        except (Exception, CheckpointException) as e:  # noqa: BLE001
+            self._failed(step, e)
+            if self.mode == "sync":
+                self._publish_if_all_ok(step, False)
         self.last_stall_s = time.perf_counter() - t0
         return self.last_stall_s
+
+    def _failed(self, step: int, e: BaseException) -> None:
+        self.n_failed += 1
+        self.log(f"!!! CHECKPOINT SAVE FAILED at step {step}: {type(e).__name__}: {str(e)[:300]} "
+                 f"(continuing; `latest` unchanged)")
+
+    def _publish_if_all_ok(self, step: int, ok: bool) -> None:
+        """All ranks agree (min over ok flags); only then publish `latest`. Otherwise clean the partial dir."""
+        flag = torch.tensor([int(ok)])
+        if dist.is_initialized():
+            dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=self._ctl)
+        if flag.item():
+            self._publish(step, barrier=False)
+        elif self.rank == 0:
+            shutil.rmtree(self.dir / step_name(step), ignore_errors=True)
 
     def poll(self) -> None:
         """Call every step: publishes `latest` as soon as an in-flight async save finishes (non-blocking)."""
@@ -99,12 +123,14 @@ class Checkpointer:
                 dist.all_reduce(done, op=dist.ReduceOp.MIN, group=self._ctl)
             if not done.item():
                 return
-        fut.result()
+        ok = True
+        try:
+            fut.result()
+        except (Exception, CheckpointException) as e:  # noqa: BLE001
+            ok = False
+            self._failed(step, e)
         self._pending = None
-        # every rank must have finished writing before rank 0 publishes
-        if dist.is_initialized():
-            dist.barrier(group=self._ctl)
-        self._publish(step, barrier=False)
+        self._publish_if_all_ok(step, ok)  # all-reduce on the control group doubles as the "everyone finished" barrier
 
     def _publish(self, step: int, barrier: bool = True) -> None:
         if barrier and dist.is_initialized():
@@ -139,10 +165,18 @@ class Checkpointer:
 def export_final(model, path: str | os.PathLike, dtype=torch.bfloat16, group=None) -> None:
     """Model weights only (no optimizer): full state dict gathered to rank 0 and saved as one .pt file."""
     sd, _ = get_state_dict(model, [], options=StateDictOptions(full_state_dict=True, cpu_offload=True))
+    err = None
     if not dist.is_initialized() or dist.get_rank(group) == 0:
-        torch.save({k: (v.to(dtype) if v.is_floating_point() else v) for k, v in sd.items()}, path)
+        try:
+            torch.save({k: (v.to(dtype) if v.is_floating_point() else v) for k, v in sd.items()}, path)
+        except OSError as e:  # e.g. ENOSPC: tell every rank so they all raise together instead of hanging
+            err = repr(e)
     if dist.is_initialized():
-        dist.barrier(group=group)  # group = the ranks that hold the model (e.g. learner ranks only in RL)
+        objs = [err]
+        dist.broadcast_object_list(objs, src=dist.get_global_rank(group, 0) if group is not None else 0, group=group)
+        err = objs[0]
+    if err:
+        raise OSError(err)
 
 
 class PreemptFlag:

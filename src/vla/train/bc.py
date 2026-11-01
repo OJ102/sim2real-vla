@@ -103,6 +103,20 @@ def main():
     err = open(run0 / f"rank{rank}.err", "a", buffering=1)  # survives even if the launcher's tee/tmux dies
     faulthandler.enable(file=err, all_threads=True)          # segfault / fatal-signal stacks
     faulthandler.register(_sig.SIGUSR2, all_threads=True, file=err)  # kill -USR2 <pid>: dump every thread stack
+    _sig.signal(_sig.SIGPIPE, _sig.SIG_IGN)  # dead tee/pipe must not kill training silently
+
+    def say(msg: str, **_kw) -> None:
+        """stdout (rank-tagged, tolerant of a dead pipe) + per-rank err file."""
+        try:
+            err.write(f"[rank {rank}] {msg}\n")
+        except OSError:
+            pass
+        if rank == 0 or msg.startswith("!!!"):
+            try:
+                print(msg, flush=True)
+            except OSError:
+                pass
+
     err.write(f"[rank {rank}] pid {os.getpid()} start {time.ctime()} host_mem {host_mem()}\n")
     cuda = device.type == "cuda"
     torch.set_float32_matmul_precision("high")
@@ -163,10 +177,13 @@ def main():
     steps_per_epoch = sampler.num_per_rank // per_rank_step
     total = cfg.steps or int(cfg.epochs * steps_per_epoch)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: lr_at(s, total, cfg.warmup))
-    ckpt = Checkpointer(cfg.ckpt_dir or run / "ckpt", cfg.ckpt_mode, cfg.ckpt_keep, cfg.ckpt_mirror or None,
-                        cfg.pg_timeout_min, cfg.ckpt_slow_s)
+    # checkpoints (8 GB each) go to $VLA_CKPT/<name> (RAM-backed on the server) when set; only final.pt/metrics on home
+    ckpt_dir = cfg.ckpt_dir or (str(Path(os.environ["VLA_CKPT"]) / cfg.name / "ckpt") if os.environ.get("VLA_CKPT")
+                                else str(run / "ckpt"))
+    ckpt = Checkpointer(ckpt_dir, cfg.ckpt_mode, cfg.ckpt_keep, cfg.ckpt_mirror or None,
+                        cfg.pg_timeout_min, cfg.ckpt_slow_s, log=say)
     if rank == 0:
-        print(f"world={world} backend={cfg.backend} frames={len(ds)} steps/epoch={steps_per_epoch} total={total} "
+        say(f"world={world} backend={cfg.backend} frames={len(ds)} steps/epoch={steps_per_epoch} total={total} "
               f"micro={cfg.micro_batch} accum={accum} global={cfg.global_batch} params={count_params(base)['total']/1e6:.1f}M",
               flush=True)
 
@@ -177,7 +194,7 @@ def main():
             step, epoch, in_epoch = ex["step"], ex["epoch"], ex["in_epoch"]
             sched.load_state_dict(ex["sched"])
             if rank == 0:
-                print(f"resume_from={step}", flush=True)
+                say(f"resume_from={step}", flush=True)
                 log.log(step, {"event_resume_from": step})
 
     def to_dev(b):
@@ -296,21 +313,21 @@ def main():
                     rec.update(validate())
                 log.log(step, rec)
                 if rank == 0:
-                    print(f"step {step}/{total} loss {rec['loss']:.4f} acc {rec['tok_acc']:.3f} "
+                    say(f"step {step}/{total} loss {rec['loss']:.4f} acc {rec['tok_acc']:.3f} "
                           f"{rec['samples_per_s']:.1f} samp/s mfu {rec['mfu']*100:.1f}%", flush=True)
             if prof is not None:
                 prof.step()
                 if step >= 8:  # 5 warmup + 3 active
                     prof.stop()
                     if rank == 0:
-                        print(f"profile written: {run}/trace_rank0.json", flush=True)
+                        say(f"profile written: {run}/trace_rank0.json", flush=True)
                     stop = True
                     break
             if preempt.should_stop(device):
                 ckpt.save(step, model, opt, extra())
                 ckpt.wait()
                 if rank == 0:
-                    print(f"preempted: saved step {step}, exiting", flush=True)
+                    say(f"preempted: saved step {step}, exiting", flush=True)
                 stop = True
                 break
         if not stop and in_epoch >= steps_per_epoch:
@@ -321,7 +338,12 @@ def main():
             ckpt.save(step, model, opt, extra())
             ckpt.wait()
         if cfg.export_final and engine is None:
-            export_final(model, run / "final.pt")
+            try:
+                export_final(model, run / "final.pt")
+            except OSError as e:  # home quota full: keep the weights somewhere that works
+                alt = Path(ckpt_dir).parent / "final.pt"
+                say(f"!!! final.pt export to {run} failed ({e}); retrying at {alt}")
+                export_final(model, alt)
     log.close()
     if dist.is_initialized():
         dist.destroy_process_group()
