@@ -269,8 +269,9 @@ def test_engine_rejects_flow_head():
 def test_engine_logp_matches_token_logprobs_at_temperature():
     """Behaviour log-probs are of softmax(logits/T): learner's token_logprobs must use the same T."""
     m = tiny(0).eval(); batch = _batch(m)
-    with torch.no_grad():
-        m.llm.get_input_embeddings().weight[m.act_base:] *= 30            # informative (non-uniform) logits
+    with torch.no_grad():  # new action rows start near-identical (mean init): randomise so logits are informative
+        w = m.llm.get_input_embeddings().weight
+        w[m.act_base:] = torch.randn(256, w.shape[1], generator=torch.Generator().manual_seed(5)) * 0.5
     out = InferenceEngine(m, temperature=0.7).generate(batch, generator=torch.Generator().manual_seed(0))
     with torch.no_grad():
         lp07 = m.token_logprobs(batch, out["bins"], 0.7)
