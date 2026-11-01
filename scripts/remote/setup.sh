@@ -8,12 +8,14 @@ cd "$(dirname "$0")/../.."
 command -v uv >/dev/null 2>&1 || { curl -LsSf https://astral.sh/uv/install.sh | sh; export PATH="$HOME/.local/bin:$PATH"; }
 uv python install 3.11
 uv sync || { echo "ERROR: uv sync failed"; exit 1; }
+# uv pip ignores UV_PROJECT_ENVIRONMENT, so point it at the project venv explicitly
+PY="${UV_PROJECT_ENVIRONMENT:-.venv}/bin/python"; [ -x "$PY" ] || PY=.venv/bin/python
 # deepspeed is optional (sdist, needs torch at build time); never fatal
-uv pip install --no-build-isolation deepspeed || echo "WARN: deepspeed install failed; DeepSpeed backend unavailable"
+DS_BUILD_OPS=0 uv pip install --python "$PY" --no-build-isolation deepspeed || echo "WARN: deepspeed install failed; DeepSpeed backend unavailable"
 
 nvidia-smi --query-gpu=name,driver_version --format=csv || echo "WARN: nvidia-smi unavailable"
 # flash-attn: prebuilt wheel only (no source build under nvcc 13.2). Fallback: torch SDPA flash backend.
-uv pip install --only-binary=:all: flash-attn 2>/dev/null \
+uv pip install --python "$PY" --only-binary=:all: flash-attn 2>/dev/null \
   || echo "WARN: no prebuilt flash-attn wheel matches this torch/CUDA; using SDPA flash backend as fallback"
 
 # Headless GL: prefer the NVIDIA driver's libEGL; fall back to OSMesa from conda-forge (user space).
@@ -61,6 +63,8 @@ for dev in range(max(n, 5)):  # EGL ids may not match CUDA order; probe each in 
     print(f"  MUJOCO_EGL_DEVICE_ID={dev}: " + (f"egl render ok {tuple(eval(shape))}" if shape else "failed"))
     if shape: ok.append(dev)
 print(f"MUJOCO_GL={os.environ.get('MUJOCO_GL')} working EGL device ids: {ok}")
+print("EGL id -> GPU mapping:")
+subprocess.run([sys.executable, "scripts/egl_map.py"])
 if not ok:
     sys.exit("ERROR: no EGL device could render")
 PY

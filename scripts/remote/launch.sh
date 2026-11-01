@@ -6,5 +6,6 @@ cd "$(dirname "$0")/../.."
 NAME=${1:?run name}; shift
 : "${VLA_RUNS:?set VLA_RUNS in .env}"
 mkdir -p "$VLA_RUNS/$NAME"
-tmux new -d -s "$NAME" "cd $PWD && $* 2>&1 | tee -a $VLA_RUNS/$NAME/stdout.log"
+# tmux sessions inherit the tmux SERVER env, not ours: source .env inside the session (UV_* vars, CUDA_VISIBLE_DEVICES)
+tmux new -d -s "$NAME" "cd $PWD && set -a && . ./.env && set +a && $* 2>&1 | tee -a $VLA_RUNS/$NAME/stdout.log"
 echo "started tmux session '$NAME' (logs: $VLA_RUNS/$NAME/stdout.log); attach: tmux attach -t $NAME"

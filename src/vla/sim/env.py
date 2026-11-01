@@ -37,11 +37,11 @@ class TabletopEnv(gym.Env):
     metadata = {"render_modes": ["rgb_array"], "render_fps": 10}
 
     def __init__(self, task: str = "lift", split: str = "train", image_size: int = 128, render_obs: bool = True,
-                 dr_config: DRConfig | None = None):
+                 dr_config: DRConfig | None = None, allow_missing_dtd: bool = False):
         assert task in TASKS and split in ("train", "heldout", "heldout_photo")
         self.task, self.split, self.image_size, self.render_obs = task, split, image_size, render_obs
         self.dr_config = dr_config or DRConfig()
-        self.model = build_model()
+        self.model = build_model(allow_missing_dtd)
         self.data = mujoco.MjData(self.model)
         m = self.model
         nm = lambda t, n: mujoco.mj_name2id(m, t, n)  # noqa: E731

@@ -1,6 +1,7 @@
 """Build the tabletop MJCF scene (Panda + table + 3 cubes + goal zone + camera + 3 lights) via MjSpec."""
 from __future__ import annotations
 
+import logging
 import os
 import warnings
 from pathlib import Path
@@ -12,6 +13,7 @@ CUBE_HALF = 0.02
 CUBE_COLORS = ("red", "green", "blue")
 CUBE_BASE_RGB = {"red": (0.85, 0.1, 0.1), "green": (0.1, 0.8, 0.1), "blue": (0.1, 0.15, 0.85)}
 N_LIGHTS = 3
+log = logging.getLogger(__name__)
 N_MATERIALS = 12  # ids 0-7 train, 8-11 held out
 # DTD photo textures: one per DTD class (47 classes, sorted by name). Material id = 12 + class index.
 # Classes 0-29 are train textures, classes 30-46 only appear in the `heldout_photo` split.
@@ -50,15 +52,22 @@ def dtd_dir() -> Path:
     return Path(os.environ.get("VLA_DTD_DIR") or (Path(os.environ.get("VLA_DATA") or Path.home() / ".cache/vla") / "dtd"))
 
 
-def _photo_pngs() -> tuple[list[str], bool]:
-    """256x256 PNG per DTD class (cached next to the DTD dir). Falls back to seeded noise if DTD is missing."""
+def _photo_pngs(allow_missing_dtd: bool = False) -> tuple[list[str], bool]:
+    """256x256 PNG per DTD class (cached next to the DTD dir).
+
+    Missing DTD is a hard error (it would silently corrupt the train texture set and the heldout_photo split) unless
+    allow_missing_dtd=True (tiny CPU tests only), which uses seeded noise placeholders."""
     src = dtd_dir()
-    out = src.parent / f"dtd_{TEX_SIZE}"
     classes = sorted(p.name for p in src.iterdir() if p.is_dir()) if src.is_dir() else []
-    out.mkdir(parents=True, exist_ok=True)
     real = len(classes) >= N_DTD
     if not real:
-        warnings.warn(f"DTD not found at {src} (run scripts/fetch_dtd.sh): photo materials are NOISE placeholders")
+        if not allow_missing_dtd:
+            raise FileNotFoundError(f"DTD not found / incomplete at {src} ({len(classes)}/{N_DTD} classes). "
+                                    "Run scripts/fetch_dtd.sh, or pass allow_missing_dtd=True (tests only).")
+        warnings.warn(f"DTD not found at {src}: photo materials are NOISE placeholders (allow_missing_dtd=True)")
+    out = src.parent / f"dtd_{TEX_SIZE}" if real else Path.home() / ".cache/vla/dtd_noise"
+    out.mkdir(parents=True, exist_ok=True)
+    log.info("texture source: %s", f"real DTD from {src}" if real else "NOISE placeholders")
     from PIL import Image
 
     paths = []
@@ -75,7 +84,7 @@ def _photo_pngs() -> tuple[list[str], bool]:
     return paths, real
 
 
-def build_model() -> mujoco.MjModel:
+def build_model(allow_missing_dtd: bool = False) -> mujoco.MjModel:
     from robot_descriptions import panda_mj_description as p
 
     spec = mujoco.MjSpec.from_file(p.MJCF_PATH)
@@ -97,7 +106,7 @@ def build_model() -> mujoco.MjModel:
         m = spec.add_material(name=f"mat{i}", texuniform=True, texrepeat=(4, 4))
         m.textures[mujoco.mjtTextureRole.mjTEXROLE_RGB] = f"tex{i}"
 
-    photos, _ = _photo_pngs()
+    photos, _ = _photo_pngs(allow_missing_dtd)
     for i, f in enumerate(photos):
         spec.add_texture(name=f"photo{i}", type=mujoco.mjtTexture.mjTEXTURE_2D, file=f)
         m = spec.add_material(name=f"mat{PHOTO_BASE + i}", texuniform=True, texrepeat=(2, 2))
