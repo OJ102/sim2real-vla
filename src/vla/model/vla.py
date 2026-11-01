@@ -43,6 +43,7 @@ class VLAConfig:
     act_dim: int = 4
     proprio_dim: int = 11
     n_bins: int = 256
+    ground_weight: float = 0.0              # >0: aux target-xy grounding head at the last prefix token (BC training only)
     image_size: int = 224                   # images are resized to this before the vision tower
     flow: FlowConfig = field(default_factory=FlowConfig)
 
@@ -113,6 +114,9 @@ class VLA(nn.Module):
         self.act_tok = ActionTokenizer(cfg.n_bins, self.act_base)
         self.act_head = ActionLMHead(self.llm, self.act_base, cfg.n_bins)
         self.n_act_tokens = cfg.chunk * cfg.act_dim
+        # created ONLY when used so checkpoints trained without it still load with strict=True
+        self.ground_head = (nn.Sequential(nn.Linear(d_llm, 256), nn.GELU(), nn.Linear(256, 2))
+                            if cfg.ground_weight > 0 else None)
         self.dit = None
         if cfg.head == "flow":
             self.dit = FlowDiT(d_llm, cfg.act_dim, cfg.chunk, cfg.proprio_dim, cfg.flow.dim, cfg.flow.layers,
@@ -158,13 +162,30 @@ class VLA(nn.Module):
         if self.cfg.head == "flow":
             h = self.llm.model(inputs_embeds=prefix, attention_mask=mask, position_ids=self._pos(mask),
                                use_cache=False).last_hidden_state
-            loss = flow_loss(self.dit, batch["actions"].to(h.dtype), batch["proprio"].to(h.dtype), h, mask)
-            return {"loss": loss}
+            main = flow_loss(self.dit, batch["actions"].to(h.dtype), batch["proprio"].to(h.dtype), h, mask)
+            return self._with_ground({"main_loss": main}, h[:, P - 1], batch)
         bins = self.act_tok.encode_bins(batch["actions"].reshape(batch["actions"].shape[0], -1))  # [B,16]
-        logits = self._discrete_logits(prefix, mask, bins)
-        loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), bins.reshape(-1))
+        logits, h_last = self._discrete_logits(prefix, mask, bins)
+        main = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), bins.reshape(-1))
         acc = (logits.argmax(-1) == bins).float().mean()
-        return {"loss": loss, "tok_acc": acc}
+        return self._with_ground({"main_loss": main, "tok_acc": acc}, h_last, batch)
+
+    def _with_ground(self, out: dict, h_last: torch.Tensor, batch: dict) -> dict:
+        """Add the (optional) target-xy grounding loss. h_last = hidden state at prefix position P-1, the only position
+        that has seen both the colour word (text) and the image. Rows with ground_mask 0 do not contribute."""
+        out["loss"] = out["main_loss"]
+        if self.ground_head is None or "ground_xy" not in batch:
+            return out
+        pred = self.ground_head(h_last).float()
+        gxy, gm = batch["ground_xy"].float(), batch["ground_mask"].float()
+        den = gm.sum().clamp(min=1.0)
+        out["ground_loss"] = (((pred - gxy) ** 2).mean(-1) * gm).sum() / den
+        with torch.no_grad():
+            gstd = batch.get("ground_std")
+            d = (pred - gxy) * (gstd.float() if gstd is not None else 1.0)
+            out["ground_err_cm"] = 100.0 * (d.norm(dim=-1) * gm).sum() / den  # metres -> cm when ground_std is given
+        out["loss"] = out["main_loss"] + self.cfg.ground_weight * out["ground_loss"]
+        return out
 
     def flow_rl_logp(self, batch: dict) -> dict:
         """batch: image/proprio/prompt + x [B,K,H,A] (state before each step), x_next, t (list of K), sde_a.
@@ -187,21 +208,21 @@ class VLA(nn.Module):
             means.append(mean.float())
         return {"logp": torch.stack(logps, 1), "mean": torch.stack(means, 1)}
 
-    def _discrete_logits(self, prefix, mask, bins) -> torch.Tensor:
-        """Teacher-forced logits over the action rows: [B, n_act_tokens, n_bins] (float32)."""
+    def _discrete_logits(self, prefix, mask, bins):
+        """Teacher-forced (logits over the action rows [B, n_act_tokens, n_bins] float32, hidden state at P-1 [B, D])."""
         P = prefix.shape[1]
         a_emb = self.llm.get_input_embeddings()(bins + self.act_base)
         x = torch.cat([prefix, a_emb[:, :-1]], dim=1)
         m = torch.cat([mask, torch.ones(x.shape[0], self.n_act_tokens - 1, dtype=mask.dtype, device=mask.device)], 1)
         h = self.llm.model(inputs_embeds=x, attention_mask=m, position_ids=self._pos(m),
                            use_cache=False).last_hidden_state
-        return self.act_head(h[:, P - 1:P - 1 + self.n_act_tokens]).float()
+        return self.act_head(h[:, P - 1:P - 1 + self.n_act_tokens]).float(), h[:, P - 1]
 
     def token_logprobs(self, batch: dict, bins: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
         """Per-token log pi(bin | prefix, previous bins) over the action vocabulary: [B, n_act_tokens].
         Uses softmax(logits / temperature), the same distribution InferenceEngine samples from, so mu == pi_old."""
         prefix, mask = self.embed_prefix(batch)
-        logp = F.log_softmax(self._discrete_logits(prefix, mask, bins) / temperature, dim=-1)
+        logp = F.log_softmax(self._discrete_logits(prefix, mask, bins)[0] / temperature, dim=-1)
         return logp.gather(-1, bins[..., None]).squeeze(-1)
 
     # ------------------------------------------------------------------ inference
