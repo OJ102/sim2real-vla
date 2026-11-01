@@ -27,7 +27,7 @@ from vla.model.vla import VLA, VLAConfig, count_params
 from vla.train.checkpoint import Checkpointer, PreemptFlag, export_final
 from vla.train.dist import init_dist, unwrap, wrap_ddp, wrap_fsdp2
 from vla.utils.config import dump_config, load_config
-from vla.utils.logging import MetricsLogger
+from vla.utils.logging import MetricsLogger, host_mem
 
 
 @dataclass
@@ -95,11 +95,15 @@ def main():
     a = ap.parse_args()
     cfg = load_config(BCConfig, a.config, a.overrides)
     rank, world, local, device = init_dist(cfg.pg_timeout_min)
-    if cfg.hang_dump_s or True:
-        import faulthandler
-        import signal as _sig
+    import faulthandler
+    import signal as _sig
 
-        faulthandler.register(_sig.SIGUSR2, all_threads=True)  # kill -USR2 <pid> prints every thread's stack
+    run0 = Path(cfg.runs_dir or os.environ.get("VLA_RUNS", "runs")) / cfg.name
+    run0.mkdir(parents=True, exist_ok=True)
+    err = open(run0 / f"rank{rank}.err", "a", buffering=1)  # survives even if the launcher's tee/tmux dies
+    faulthandler.enable(file=err, all_threads=True)          # segfault / fatal-signal stacks
+    faulthandler.register(_sig.SIGUSR2, all_threads=True, file=err)  # kill -USR2 <pid>: dump every thread stack
+    err.write(f"[rank {rank}] pid {os.getpid()} start {time.ctime()} host_mem {host_mem()}\n")
     cuda = device.type == "cuda"
     torch.set_float32_matmul_precision("high")
     run = Path(cfg.runs_dir or os.environ.get("VLA_RUNS", "runs")) / cfg.name
@@ -269,7 +273,9 @@ def main():
 
             stall = 0.0
             if step % cfg.ckpt_every == 0 and engine is None:
+                err.write(f"[rank {rank}] step {step} save start host_mem {host_mem()}\n")
                 stall = ckpt.save(step, model, opt, extra())
+                err.write(f"[rank {rank}] step {step} save staged ({stall:.2f}s) host_mem {host_mem()}\n")
             if step % cfg.log_every == 0 or step == total:
                 m = torch.stack([loss_acc, acc_acc])
                 if dist.is_initialized():
@@ -285,7 +291,7 @@ def main():
                        "samples_per_s": cfg.global_batch / dt, "lr": opt.param_groups[0]["lr"], "epoch": epoch,
                        "mfu": flops_s * cfg.global_batch / dt / (world * cfg.peak_tflops * 1e12),
                        "mem_alloc_gb_per_rank": [x.item() for x in mems], "ckpt_stall_s": stall,
-                       "data_wait_s": data_wait, "compute_s": dt - data_wait}
+                       "data_wait_s": data_wait, "compute_s": dt - data_wait, **host_mem()}
                 if step % cfg.val_every == 0 and len(val_ds):
                     rec.update(validate())
                 log.log(step, rec)

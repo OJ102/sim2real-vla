@@ -44,3 +44,38 @@ def _py(v):
         return v.item()  # numpy / torch scalar
     except AttributeError:
         return v
+
+
+def host_mem() -> dict:
+    """Host-side memory diagnostics for silent-death hunting: process RSS, its cgroup's usage/limit/events, /dev/shm use."""
+    import shutil
+
+    out: dict = {}
+    try:
+        for ln in open("/proc/self/status"):
+            if ln.startswith("VmRSS:"):
+                out["rss_gb"] = int(ln.split()[1]) / 2**20
+    except OSError:
+        pass
+    try:
+        cg = [x for x in open("/proc/self/cgroup").read().splitlines() if x.startswith("0::")][0][3:]
+        base = f"/sys/fs/cgroup{cg}"
+        for key, f in (("cgroup_mem_gb", "memory.current"), ("cgroup_mem_max_gb", "memory.max"),
+                       ("cgroup_mem_high_gb", "memory.high")):
+            try:
+                v = open(f"{base}/{f}").read().strip()
+                out[key] = float(v) / 2**30 if v != "max" else float("inf")
+            except OSError:
+                pass
+        try:
+            ev = dict(x.split() for x in open(f"{base}/memory.events").read().splitlines())
+            out["cgroup_oom_kill"] = int(ev.get("oom_kill", 0))
+        except OSError:
+            pass
+    except (OSError, IndexError):
+        pass
+    try:
+        out["shm_used_gb"] = shutil.disk_usage("/dev/shm").used / 2**30
+    except OSError:
+        pass
+    return out

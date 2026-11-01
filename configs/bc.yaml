@@ -12,7 +12,7 @@ bf16: true
 ckpt_every: 100
 ckpt_mode: async
 ckpt_keep: 2
-num_workers: 8
+num_workers: 2   # data_wait_s ~0.001 at 8; fewer workers = less host RAM (32 procs x torch import)
 prefetch_factor: 4
 pg_timeout_min: 10
 hang_dump_s: 180      # dump all thread stacks to stdout if one step takes >3 min
