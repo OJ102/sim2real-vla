@@ -4,5 +4,6 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 HOST=${1:-ucgpu}; DIR=${2:-vla}
-# --delete does not remove excluded files on the server (.env, .venv, data stay)
-rsync -az --delete --exclude .git --filter=':- .gitignore' ./ "$HOST:$DIR/"
+# Explicit P (protect) rules: a dir-merge ':- .gitignore' does NOT protect receiver-side files from --delete.
+rsync -az --delete --exclude .git --exclude .env --filter='P .env' --filter='P .env.gl' \
+  --filter=':- .gitignore' ./ "$HOST:$DIR/"

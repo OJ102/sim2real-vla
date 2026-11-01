@@ -25,11 +25,21 @@ PUSH_DIST = 0.14
 
 
 def set_egl_device(worker_id: int, device_ids: list[int] | None = None) -> None:
-    """Round-robin MUJOCO_EGL_DEVICE_ID over the A100 EGL ids (env VLA_EGL_DEVICES=1,2,..). Call before creating envs."""
+    """Round-robin MUJOCO_EGL_DEVICE_ID over A100 EGL ids. Source: arg, else $VLA_EGL_DEVICES, else the
+    egl.recommended_ids() mapping, else [0]. No-op off Linux. Call before creating envs."""
     import os
+    import sys
 
+    if not sys.platform.startswith("linux"):
+        return
     if device_ids is None:
-        device_ids = [int(x) for x in os.environ.get("VLA_EGL_DEVICES", "0").split(",")]
+        env = os.environ.get("VLA_EGL_DEVICES", "").strip()
+        if env:
+            device_ids = [int(x) for x in env.split(",")]
+        else:
+            from .egl import recommended_ids
+
+            device_ids = recommended_ids() or [0]
     os.environ["MUJOCO_EGL_DEVICE_ID"] = str(device_ids[worker_id % len(device_ids)])
 
 

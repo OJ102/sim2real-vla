@@ -53,18 +53,36 @@ if n == 0 or bad:
     print("ERROR: no devices or a visible device is not an A100 (check CUDA_VISIBLE_DEVICES in .env)")
     sys.exit(1)
 import subprocess
-code = ("from vla.sim.env import TabletopEnv; e=TabletopEnv('lift','train'); "
-        "print(e.reset(seed=0)[0]['image'].shape)")
+from vla.sim.egl import map_devices
+try:
+    rows = map_devices()
+    n_egl = len(rows)
+except Exception as e:  # mapping failed: still probe a generous range
+    print(f"EGL->GPU mapping unavailable ({e}); probing ids 0..15")
+    rows, n_egl = [], 16
+# every EGL device is rendered in its own subprocess; GL_RENDERER must contain NVIDIA (llvmpipe etc. = failed)
+code = ("from vla.sim.env import TabletopEnv; from vla.sim.egl import gl_renderer\n"
+        "e=TabletopEnv('lift','train',allow_missing_dtd=True)\n"  # probe tests GL only; DTD is checked separately
+        "s=e.reset(seed=0)[0]['image'].shape; print(s, '|', gl_renderer())")
 ok = []
-for dev in range(max(n, 5)):  # EGL ids may not match CUDA order; probe each in a subprocess
+for dev in range(n_egl):
     r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
                        env={**os.environ, "MUJOCO_EGL_DEVICE_ID": str(dev)})
-    shape = r.stdout.strip().splitlines()[-1] if r.returncode == 0 and r.stdout.strip() else None
-    print(f"  MUJOCO_EGL_DEVICE_ID={dev}: " + (f"egl render ok {tuple(eval(shape))}" if shape else "failed"))
-    if shape: ok.append(dev)
-print(f"MUJOCO_GL={os.environ.get('MUJOCO_GL')} working EGL device ids: {ok}")
-print("EGL id -> GPU mapping:")
-subprocess.run([sys.executable, "scripts/egl_map.py"])
-if not ok:
-    sys.exit("ERROR: no EGL device could render")
+    last = r.stdout.strip().splitlines()[-1] if r.returncode == 0 and r.stdout.strip() else ""
+    gpu = rows[dev]["gpu_name"] if dev < len(rows) else None
+    if "|" in last:
+        shape, renderer = (x.strip() for x in last.split("|", 1))
+        good = "NVIDIA" in renderer
+        print(f"  EGL id {dev} [{gpu}]: render {shape} GL_RENDERER={renderer!r} -> {'OK' if good else 'REJECTED (not NVIDIA)'}")
+        if good:
+            ok.append(dev)
+    else:
+        err = (r.stderr.strip().splitlines() or ["?"])[-1][:120]
+        print(f"  EGL id {dev} [{gpu}]: FAILED ({err})")
+print(f"MUJOCO_GL={os.environ.get('MUJOCO_GL')} working NVIDIA EGL ids: {ok}")
+a100 = [r["egl_id"] for r in rows if r["gpu_name"] and "A100" in r["gpu_name"]]
+rec = [d for d in a100 if d in ok] if rows else ok
+print(f"recommended VLA_EGL_DEVICES={','.join(map(str, rec))}  (A100 + NVIDIA renderer; put in .env, or leave unset to auto-pick)")
+if not rec:
+    sys.exit("ERROR: no usable NVIDIA EGL device on an A100")
 PY
