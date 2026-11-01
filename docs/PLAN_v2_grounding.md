@@ -56,3 +56,12 @@ If tight, cap flow at 1000 steps.
 - `test_shard_fields`: 2-episode CPU generate writes `cube_pos` [N,3,3], `target_idx` [E]; `ds[i]["ground_xy"]` == normalised `cube_pos[row, target_idx, :2]`; legacy shard → `ground_mask=0`; stats.json has `target_xy_mean/std`.
 - `test_probe_smoke`: probe runs on CPU with tiny ckpt + 2 shards; JSON has all keys per task and part.
 - `test_stop_at`: `bc_tiny stop_at=3` exits 0, writes `stop_3.pt` + ckpt; resume reaches `steps` with unchanged lr schedule (lr at step 4 equals uninterrupted run).
+
+## Amendment A (2026-11-01, user-approved): counterfactual colour queries
+Gate at step 500 FAILED for both heads (val t=0: disc reach .41 / lift .40, flow .19 / .23; colour swap changes nothing; ground_err_cm_t0 12–14 cm ≈ chance). At h[P-1], ground-head output moves 0.004 (normalised) across colour words vs 0.60 across images: the aux target is solvable from image/proprio on every frame except t=0, so it shortcuts like the action loss. Fix: make the aux label depend on the word.
+- `ground_swap_p` (default 0.0 = off; ground configs 0.25). Per sample, with prob p: replace the cube colour in the instruction (regex `the (red|green|blue) cube`, so push's "yellow zone" is untouched) by one of the other two colours uniformly; aux label = that cube's normalised xy (from stored `cube_pos`); `swap=1` → row excluded from the main (action) loss.
+- Deterministic and resumable: rng = `default_rng([seed, epoch, i])`; `bc.py` calls `dataset.set_epoch(epoch)` next to `sampler.set_epoch`. Val: never swapped for `val_main_loss`; add `val_ground_err_cm_swap` on a swapped val pass (p=1) and redefine `val_ground_err_cm_t0` as t==0 exactly.
+- Main loss per-row: CE (discrete) and flow MSE averaged over non-swapped rows only, divide by max(count,1).
+- New run names `bc_gdisc2` / `bc_gflow2` (fresh runs, same schedule, stop_at=500 gate, same gate criteria on the t=0 probe).
+- Tests: p=0 reproduces current batches exactly; same (seed, epoch, i) → same swap; swapped row has a different colour word and ground_xy == that cube's normalised xy; push "yellow zone" untouched; all-swapped batch → main_loss 0 without NaN, ground loss finite; main loss ignores swapped rows (perturbing their actions changes nothing).
+- Budget: +1.3 GPU-h (re-gate both heads).
