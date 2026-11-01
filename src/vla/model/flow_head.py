@@ -61,7 +61,7 @@ class FlowDiT(nn.Module):
     def forward(self, x_t, t, proprio, ctx, ctx_mask):
         """x_t [B,H,act_dim], t [B], proprio [B,P], ctx [B,S,ctx_dim], ctx_mask [B,S] (1=valid) -> velocity [B,H,act_dim]."""
         x = torch.cat([self.act_in(x_t), self.proprio_in(proprio)[:, None]], dim=1) + self.pos
-        c = self.t_mlp(timestep_embedding(t, self.d))
+        c = self.t_mlp(timestep_embedding(t, self.d).to(x.dtype))
         ctx = self.ctx_proj(ctx)
         pad = ctx_mask == 0
         for blk in self.blocks:
@@ -87,9 +87,10 @@ def flow_loss(dit: FlowDiT, actions, proprio, ctx, ctx_mask, t=None, noise=None)
 @torch.no_grad()
 def euler_sample(dit: FlowDiT, proprio, ctx, ctx_mask, steps: int = 10, noise=None):
     b = proprio.shape[0]
-    x = torch.randn(b, dit.chunk, dit.act_dim, device=proprio.device) if noise is None else noise.clone()
+    x = (torch.randn(b, dit.chunk, dit.act_dim, device=proprio.device, dtype=proprio.dtype) if noise is None
+         else noise.clone().to(proprio.dtype))
     dt = 1.0 / steps
     for i in range(steps):
-        t = torch.full((b,), 1.0 - i * dt, device=proprio.device)
+        t = torch.full((b,), 1.0 - i * dt, device=proprio.device, dtype=proprio.dtype)
         x = x - dt * dit(x, t, proprio, ctx, ctx_mask)
     return x.clamp(-1, 1)
