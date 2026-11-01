@@ -176,12 +176,12 @@ class VLA(nn.Module):
                                use_cache=False).last_hidden_state
         pro = batch["proprio"].to(h.dtype)
         ts, a = [float(t) for t in batch["t"]], float(batch["sde_a"])
-        x, xn = batch["x"].to(h.dtype), batch["x_next"].to(h.dtype)
+        x, xn = batch["x"].float(), batch["x_next"].float()  # chain/log-prob math in fp32; only the DiT runs in bf16
         K = x.shape[1]
         logps, means = [], []
         for i in range(K):
             h_ = ts[i] - (ts[i + 1] if i + 1 < K else 0.0)
-            v = self.dit(x[:, i], torch.full((x.shape[0],), ts[i], device=x.device, dtype=h.dtype), pro, h, mask)
+            v = self.dit(x[:, i], torch.full((x.shape[0],), ts[i], device=x.device, dtype=h.dtype), pro, h, mask).float()
             mean, std = sde_step_stats(x[:, i], v, ts[i], h_, a)
             logps.append(gaussian_logprob(xn[:, i], mean, std).float())
             means.append(mean.float())

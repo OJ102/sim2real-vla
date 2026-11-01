@@ -144,17 +144,20 @@ def flow_sde_sample(dit: FlowDiT, proprio, ctx, ctx_mask, K: int = 5, a: float =
     x_next [B,K,H,A], logp [B,K] (behaviour log-prob of each step), t list (len K), std list (len K)."""
     b = proprio.shape[0]
     dev, dt_ = proprio.device, proprio.dtype
-    x = (torch.randn(b, dit.chunk, dit.act_dim, device=dev, dtype=dt_, generator=generator) if noise is None
-         else noise.clone().to(dt_))
+    cd = torch.float64 if dt_ == torch.float64 else torch.float32  # chain dtype
+    # the SDE chain and its Gaussian log-probs are kept in fp32 (only the DiT forward runs in bf16): a bf16 chain
+    # makes log-probs of ~16 small-std Gaussians quantise by ~0.1 and would bias the PPO/TIS ratios
+    x = (torch.randn(b, dit.chunk, dit.act_dim, device=dev, dtype=cd, generator=generator) if noise is None
+         else noise.clone().to(cd))
     ts = sde_grid(K) if ts is None else ts
     xs, xn, lps, stds = [], [], [], []
     for i in range(K):
         t, h = ts[i], ts[i] - ts[i + 1]
-        v = dit(x, torch.full((b,), t, device=dev, dtype=dt_), proprio, ctx, ctx_mask)
+        v = dit(x, torch.full((b,), t, device=dev, dtype=dt_), proprio, ctx, ctx_mask).to(cd)
         mean, std = sde_step_stats(x, v, t, h, a)
-        z = torch.randn(x.shape, device=dev, dtype=dt_, generator=generator)
+        z = torch.randn(x.shape, device=dev, dtype=cd, generator=generator)
         x_next = mean + std * z if std > 0 else mean
-        lps.append(gaussian_logprob(x_next, mean, std) if std > 0 else torch.zeros(b, device=dev, dtype=dt_))
+        lps.append(gaussian_logprob(x_next, mean, std) if std > 0 else torch.zeros(b, device=dev, dtype=cd))
         xs.append(x); xn.append(x_next); stds.append(std)
         x = x_next
     return {"actions": x.clamp(-1, 1), "x": torch.stack(xs, 1), "x_next": torch.stack(xn, 1),
