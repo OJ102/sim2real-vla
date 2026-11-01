@@ -192,6 +192,21 @@ def main():
     # checkpoints (8 GB each) go to $VLA_CKPT/<name> (RAM-backed on the server) when set; only final.pt/metrics on home
     ckpt_dir = cfg.ckpt_dir or (str(Path(os.environ["VLA_CKPT"]) / cfg.name / "ckpt") if os.environ.get("VLA_CKPT")
                                 else str(run / "ckpt"))
+    art_dir = Path(ckpt_dir).parent  # best.pt / stop_<step>.pt live here (RAM-backed $VLA_CKPT/<name> on the server)
+    art_dir.mkdir(parents=True, exist_ok=True)
+
+    def publish_best():
+        """Copy best.pt to the run dir ONCE at the end (rank 0): repeated 1.2 GB writes to the quota'd home are costly."""
+        src, dst = art_dir / "best.pt", run / "best.pt"
+        if rank == 0 and src.exists() and src.resolve() != dst.resolve():
+            try:
+                import shutil
+
+                shutil.copyfile(src, dst)
+                say(f"best.pt copied to {dst}")
+            except OSError as e:
+                say(f"!!! could not copy best.pt to {dst}: {e} (it remains at {src})")
+
     ckpt = Checkpointer(ckpt_dir, cfg.ckpt_mode, cfg.ckpt_keep, cfg.ckpt_mirror or None,
                         cfg.pg_timeout_min, cfg.ckpt_slow_s, log=say)
     say(f"attn_implementation: llm={base.llm.config._attn_implementation} "
@@ -359,8 +374,8 @@ def main():
                     if cfg.keep_best and rec["val_main_loss"] < best_val:
                         best_val = rec["val_main_loss"]
                         try:
-                            export_final(model, run / "best.pt")  # collective: val metrics are all-reduced, so all ranks agree
-                            say(f"best.pt updated at step {step}: val_main_loss {best_val:.4f}")
+                            export_final(model, art_dir / "best.pt")  # collective: val metrics are all-reduced, so all ranks agree
+                            say(f"best.pt updated at step {step}: val_main_loss {best_val:.4f} -> {art_dir / 'best.pt'}")
                         except (OSError, RuntimeError) as e:
                             say(f"!!! best.pt export failed: {e}")
                 log.log(step, rec)
@@ -379,10 +394,11 @@ def main():
                 ckpt.save(step, model, opt, extra())
                 ckpt.wait()
                 try:
-                    export_final(model, run / f"stop_{step}.pt")
+                    export_final(model, art_dir / f"stop_{step}.pt")
                 except (OSError, RuntimeError) as e:
                     say(f"!!! stop_{step}.pt export failed: {e}")
-                say(f"stop_at={cfg.stop_at}: saved ckpt + stop_{step}.pt, exiting (resume with --resume and the same steps)")
+                say(f"stop_at={cfg.stop_at}: saved ckpt + {art_dir / f'stop_{step}.pt'}, exiting (resume with --resume and the same steps)")
+                publish_best()
                 stop = True
                 break
             if preempt.should_stop(device):
@@ -396,6 +412,7 @@ def main():
             epoch, in_epoch = epoch + 1, 0
     ckpt.wait()
     if not stop:
+        publish_best()
         if step % cfg.ckpt_every != 0 and engine is None:
             ckpt.save(step, model, opt, extra())
             ckpt.wait()
