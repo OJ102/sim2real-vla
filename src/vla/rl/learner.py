@@ -15,6 +15,7 @@ import torch
 import torch.distributed as dist
 
 from vla.model.prompts import encode_instructions
+from vla.model.flow_head import gaussian_kl
 from vla.rl.algo import group_advantages, grpo_loss, staleness_hist
 from vla.rl.rollout_worker import batch_path
 from vla.rl.weight_sync import sync_weights
@@ -36,7 +37,7 @@ def wait_for(paths: list[Path], timeout: float, log) -> float:
 
 def load_batches(paths: list[Path], G: int):
     """-> flat sample arrays + per-sample advantage/version, and per-episode stats for logging."""
-    cols = {k: [] for k in ("image", "proprio", "bins", "logp", "adv", "version", "instr")}
+    cols = {k: [] for k in ("image", "proprio", "logp", "adv", "version", "instr")}
     ep_stats = {"ret": [], "succ": [], "comp": {}}
     metas = []
     for p in paths:
@@ -44,7 +45,12 @@ def load_batches(paths: list[Path], G: int):
         R = torch.from_numpy(d["ep_return"])
         adv_ep = group_advantages(R.view(-1, G)).view(-1).numpy()
         ep = d["ep"]
-        cols["image"].append(d["image"]); cols["proprio"].append(d["proprio"]); cols["bins"].append(d["bins"])
+        cols["image"].append(d["image"]); cols["proprio"].append(d["proprio"])
+        for k in ("bins", "x", "x_next"):  # discrete tokens or flow latents
+            if k in d.files:
+                cols.setdefault(k, []).append(d[k])
+        if "t" in d.files:
+            extra_t = (d["t"], d["std"])
         cols["logp"].append(d["logp"]); cols["adv"].append(adv_ep[ep])
         cols["version"].append(np.full(len(ep), int(d["version"]))); cols["instr"].extend(d["instr"][ep].tolist())
         ep_stats["ret"].append(d["ep_return"]); ep_stats["succ"].append(d["ep_success"])
@@ -53,6 +59,8 @@ def load_batches(paths: list[Path], G: int):
                 ep_stats["comp"].setdefault(k[5:], []).append(d[k])
         metas.append(json.loads(str(d["meta"])))
     out = {k: (np.concatenate(v) if k != "instr" else v) for k, v in cols.items()}
+    if "x_next" in out:
+        out["t"], out["std"] = extra_t
     return out, ep_stats, metas
 
 
@@ -67,16 +75,23 @@ def learner_loop(cfg, roles, rank, device, model, ref, learner_pg, sync_pg, shm:
     tok = model.tokenizer if hasattr(model, "tokenizer") else None
     base = model.module if hasattr(model, "module") else model
     tok = base.tokenizer
+    is_flow = base.cfg.head == "flow"
     amp = torch.autocast("cuda", dtype=torch.bfloat16) if cuda else contextlib.nullcontext()
 
     def mk(batch_np, idx):
         b = {"image": torch.from_numpy(batch_np["image"][idx]).to(device),
              "proprio": torch.from_numpy(batch_np["proprio"][idx]).to(device),
-             "bins": torch.from_numpy(batch_np["bins"][idx]).to(device), "temperature": cfg.temperature,
              **{k: v.to(device) for k, v in encode_instructions(tok, [batch_np["instr"][i] for i in idx]).items()}}
+        if is_flow:
+            b.update({"x": torch.from_numpy(batch_np["x"][idx]).to(device),
+                      "x_next": torch.from_numpy(batch_np["x_next"][idx]).to(device),
+                      "t": batch_np["t"].tolist(), "sde_a": cfg.flow_sde_a, "train_backbone": cfg.train_backbone})
+        else:
+            b.update({"bins": torch.from_numpy(batch_np["bins"][idx]).to(device), "temperature": cfg.temperature})
         return b
 
-    info = sync_weights(model, sync_pg if is_src else None, roles.sync_src, 0, sync_dtype=cfg.sync_dtype_t)
+    info = sync_weights(model, sync_pg if is_src else None, roles.sync_src, 0, sync_dtype=cfg.sync_dtype_t,
+                       prefix=cfg.sync_prefix)
     log(f"[learner] initial sync done {info['latency_ms']:.0f} ms")
     tot_tokens = 0
     t_run = time.perf_counter()
@@ -85,21 +100,28 @@ def learner_loop(cfg, roles, rank, device, model, ref, learner_pg, sync_pg, shm:
         paths = [batch_path(shm, r, j) for r in roles.rollout_ranks]
         waited = wait_for(paths, cfg.wait_timeout_s, log)
         data, es, metas = load_batches(paths, cfg.group_size)
-        N = len(data["bins"])
+        N = len(data["logp"])
         usable = (N // (nL * cfg.micro_batch)) * (nL * cfg.micro_batch)
         order = np.random.default_rng(cfg.seed * 1000 + j).permutation(N)[:usable]
         mine = order[lr_i::nL]  # this rank's shard (equal size on all learner ranks)
         t_upd = time.perf_counter()
         # pi_old (learner weights at the start of the update) and pi_ref, in micro-batches
-        lp_old, lp_ref = [], []
+        lp_old, lp_ref, mean_ref = [], [], []
         with torch.no_grad(), amp:
             model.eval()
             for s in range(0, len(mine), cfg.micro_batch):
                 b = mk(data, mine[s:s + cfg.micro_batch])
                 lp_old.append(model(b)["logp"].float())
-                lp_ref.append(ref.token_logprobs(b, b["bins"], cfg.temperature).float())
+                if is_flow:
+                    r_ = ref.flow_rl_logp(b)
+                    lp_ref.append(r_["logp"]); mean_ref.append(r_["mean"])
+                else:
+                    lp_ref.append(ref.token_logprobs(b, b["bins"], cfg.temperature).float())
             model.train()
         lp_old, lp_ref = torch.cat(lp_old), torch.cat(lp_ref)
+        if is_flow:
+            mean_ref = torch.cat(mean_ref)
+            std_t = torch.tensor(data["std"], device=device, dtype=torch.float32).view(1, -1)
         beh = torch.from_numpy(data["logp"][mine]).to(device)
         adv = torch.from_numpy(data["adv"][mine]).float().to(device)
         ver = data["version"][mine]
@@ -118,10 +140,12 @@ def learner_loop(cfg, roles, rank, device, model, ref, learner_pg, sync_pg, shm:
                     ms = sel[m0:m0 + cfg.micro_batch]
                     b = mk(data, mine[ms])
                     with amp:
-                        lp_new = model(b)["logp"].float()
+                        o_ = model(b)
+                    lp_new = o_["logp"].float()
                     t_ = torch.from_numpy(ms).to(device)
+                    kl_ = gaussian_kl(o_["mean"].float(), mean_ref[t_], std_t) if is_flow else None  # closed form
                     loss, m = grpo_loss(lp_new, lp_old[t_], beh[t_], lp_ref[t_], adv[t_], None, cfg.clip_eps,
-                                        cfg.beta, cfg.tis_cap)
+                                        cfg.beta, cfg.tis_cap, kl=kl_)
                     (loss * len(ms) / mb).backward()
                     for k, v in m.items():
                         acc.setdefault(k, []).append(v)
@@ -131,12 +155,14 @@ def learner_loop(cfg, roles, rank, device, model, ref, learner_pg, sync_pg, shm:
                 m["grad_norm"] = float(gn)
                 mets.append(m)
         upd_time = time.perf_counter() - t_upd
-        tot_tokens += n_mine * cfg.epochs * base.n_act_tokens * nL
+        tok_per = cfg.flow_steps_rl if is_flow else base.n_act_tokens  # 'tokens' = denoising steps for flow
+        tot_tokens += n_mine * cfg.epochs * tok_per * nL
         # weight sync: after update j for j < K-S (rollouts take exactly K-S syncs)
         sync_ms = 0.0
         if j < K - S:
             t_s = time.perf_counter()
-            info = sync_weights(model, sync_pg if is_src else None, roles.sync_src, j + 1, sync_dtype=cfg.sync_dtype_t)
+            info = sync_weights(model, sync_pg if is_src else None, roles.sync_src, j + 1, sync_dtype=cfg.sync_dtype_t,
+                               prefix=cfg.sync_prefix)
             sync_ms = (time.perf_counter() - t_s) * 1e3
         it_time = time.perf_counter() - t_iter
         if rank == roles.learner_ranks[0]:
@@ -147,7 +173,7 @@ def learner_loop(cfg, roles, rank, device, model, ref, learner_pg, sync_pg, shm:
                    **{f"R_{k}": float(np.concatenate(v).mean()) for k, v in es["comp"].items()},
                    **agg, "engine_mismatch_equal_version": mism_eq,
                    "staleness_hist": staleness_hist(torch.from_numpy(data["version"]), j),
-                   "sync_latency_ms": sync_ms, "learner_tokens_per_s": n_mine * nL * cfg.epochs * base.n_act_tokens / upd_time,
+                   "sync_latency_ms": sync_ms, "learner_tokens_per_s": n_mine * nL * cfg.epochs * tok_per / upd_time,
                    "env_steps_per_s": float(sum(m["env_steps"] for m in metas) / max(m["gen_time"] for m in metas)),
                    "learner_idle_frac": waited / it_time, "rollout_idle_s": float(np.mean([m["idle_s"] for m in metas])),
                    "iter_time_s": it_time}

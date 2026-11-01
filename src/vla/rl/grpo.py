@@ -45,6 +45,9 @@ class RLConfig:
     seeds_per_iter: int = 8             # per rollout rank
     group_size: int = 8                 # G
     temperature: float = 1.0
+    flow_sde_a: float = 0.7            # Flow-GRPO noise level a in sigma_t = a*sqrt(t/(1-t))
+    flow_steps_rl: int = 5             # K denoising steps during RL (eval uses the 10-step ODE)
+    train_backbone: bool = False       # flow RL: train only the DiT (backbone frozen); only the DiT is weight-synced
     engine_mode: str = "eager"          # rollout engine: eager | static | graph (CUDA graphs; set graph on GPU)
     max_prompt_tokens: int = 32         # static-cache sizing: fixed prefix budget so one CUDA graph serves all batches
     lr: float = 2.0e-6
@@ -62,6 +65,10 @@ class RLConfig:
     mem_cap_gb: float = 20.0            # per process (shared GPUs)
     ckpt_every: int = 10
     wait_timeout_s: float = 1800.0
+
+    @property
+    def sync_prefix(self):
+        return "dit." if (self.head == "flow" and not self.train_backbone) else None
 
     @property
     def n_envs(self) -> int:
@@ -111,6 +118,10 @@ def main():
         stats = json.load(open(Path(cfg.data_dir) / "stats.json"))
     p_mean = np.array(stats["proprio_mean"], np.float32) if stats else None
     p_std = np.array(stats["proprio_std"], np.float32) if stats else None
+
+    if cfg.head == "flow" and not cfg.train_backbone:
+        for n_, p_ in model.named_parameters():
+            p_.requires_grad_(n_.startswith("dit."))  # backbone frozen, flow head trains
 
     if role == "rollout":
         model.to(device, torch.bfloat16 if cuda else torch.float32).eval()

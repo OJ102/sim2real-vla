@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from vla.utils.config import load_config
 
 from .action_tokenizer import ActionTokenizer
-from .flow_head import FlowDiT, euler_sample, flow_loss
+from .flow_head import FlowDiT, euler_sample, flow_loss, gaussian_logprob, sde_step_stats
 from .prompts import ByteTokenizer, HFTokenizer
 
 
@@ -149,6 +149,8 @@ class VLA(nn.Module):
     # ------------------------------------------------------------------ training
     def forward(self, batch: dict) -> dict:
         """batch: image, proprio [B,P] (normalised), input_ids, attention_mask, actions [B,H,act_dim] in [-1,1]."""
+        if "x_next" in batch:  # Flow-GRPO path: per-denoising-step Gaussian log-probs (+ means for the closed-form KL)
+            return self.flow_rl_logp(batch)
         if "bins" in batch:  # RL path: per-token log-probs; goes through forward() so FSDP2 root hooks fire
             return {"logp": self.token_logprobs(batch, batch["bins"], batch.get("temperature", 1.0))}
         prefix, mask = self.embed_prefix(batch)
@@ -163,6 +165,27 @@ class VLA(nn.Module):
         loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), bins.reshape(-1))
         acc = (logits.argmax(-1) == bins).float().mean()
         return {"loss": loss, "tok_acc": acc}
+
+    def flow_rl_logp(self, batch: dict) -> dict:
+        """batch: image/proprio/prompt + x [B,K,H,A] (state before each step), x_next, t (list of K), sde_a.
+        Returns {"logp": [B,K], "mean": [B,K,H,A]} of the Gaussian transition under the CURRENT DiT. The backbone runs
+        under no_grad unless batch["train_backbone"] (default: only the DiT is trained in flow RL)."""
+        with torch.set_grad_enabled(bool(batch.get("train_backbone", False)) and torch.is_grad_enabled()):
+            prefix, mask = self.embed_prefix(batch)
+            h = self.llm.model(inputs_embeds=prefix, attention_mask=mask, position_ids=self._pos(mask),
+                               use_cache=False).last_hidden_state
+        pro = batch["proprio"].to(h.dtype)
+        ts, a = [float(t) for t in batch["t"]], float(batch["sde_a"])
+        x, xn = batch["x"].to(h.dtype), batch["x_next"].to(h.dtype)
+        K = x.shape[1]
+        logps, means = [], []
+        for i in range(K):
+            h_ = ts[i] - (ts[i + 1] if i + 1 < K else 0.0)
+            v = self.dit(x[:, i], torch.full((x.shape[0],), ts[i], device=x.device, dtype=h.dtype), pro, h, mask)
+            mean, std = sde_step_stats(x[:, i], v, ts[i], h_, a)
+            logps.append(gaussian_logprob(xn[:, i], mean, std).float())
+            means.append(mean.float())
+        return {"logp": torch.stack(logps, 1), "mean": torch.stack(means, 1)}
 
     def _discrete_logits(self, prefix, mask, bins) -> torch.Tensor:
         """Teacher-forced logits over the action rows: [B, n_act_tokens, n_bins] (float32)."""

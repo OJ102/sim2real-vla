@@ -162,3 +162,35 @@ class InferenceEngine:
         got = self.generate(batch, greedy=True)
         return {"token_agreement": float((ref["bins"] == got["bins"]).float().mean()),
                 "max_logp_diff": float((ref["logp"] - got["logp"]).abs().max()), "graph_status": self.graph_status}
+
+
+class FlowEngine:
+    """Rollout engine for the flow head: backbone prefill (no KV cache needed: the DiT cross-attends to the prefix
+    hidden states) + K-step Flow-GRPO SDE sampling. Stores per-step latents and behaviour log-probs for RL."""
+
+    def __init__(self, model: VLA, K: int = 5, sde_a: float = 0.7):
+        assert model.cfg.head == "flow"
+        self.model, self.K, self.a, self.version = model, K, sde_a, 0
+
+    @torch.no_grad()
+    def generate(self, batch: dict, greedy: bool = False, generator: torch.Generator | None = None) -> dict:
+        from vla.model.flow_head import euler_sample, flow_sde_sample
+
+        m = self.model
+        prefix, mask = m.embed_prefix(batch)
+        h = m.llm.model(inputs_embeds=prefix, attention_mask=mask, position_ids=m._pos(mask),
+                        use_cache=False).last_hidden_state
+        pro = batch["proprio"].to(h.dtype)
+        if greedy:  # eval: deterministic 10-step ODE
+            act = euler_sample(m.dit, pro, h, mask, m.cfg.flow.steps)
+            return {"actions": act, "version": self.version}
+        out = flow_sde_sample(m.dit, pro, h, mask, self.K, self.a, generator)
+        out["version"] = self.version
+        return out
+
+
+def make_engine(model: VLA, temperature: float = 1.0, mode: str = "eager", max_prefix: int | None = None,
+                flow_K: int = 5, sde_a: float = 0.7):
+    if model.cfg.head == "flow":
+        return FlowEngine(model, flow_K, sde_a)
+    return InferenceEngine(model, temperature, mode, max_prefix)

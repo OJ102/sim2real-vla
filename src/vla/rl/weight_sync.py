@@ -19,8 +19,11 @@ def clean_name(n: str) -> str:
     return n.replace("_checkpoint_wrapped_module.", "").replace("_orig_mod.", "").replace("_fsdp_wrapped_module.", "")
 
 
-def _items(model: nn.Module, sync_dtype):
-    return [(clean_name(n), p, sync_dtype or p.dtype) for n, p in model.named_parameters()]
+def _items(model: nn.Module, sync_dtype, prefix: str | None = None):
+    """(name, param, dtype) for all params, or only those whose cleaned name starts with `prefix` (e.g. "dit."
+    when the backbone is frozen: only the flow head changes, so only it is synced)."""
+    out = [(clean_name(n), p, sync_dtype or p.dtype) for n, p in model.named_parameters()]
+    return [x for x in out if prefix is None or x[0].startswith(prefix)]
 
 
 def plan_buckets(items, bucket_bytes: int = BUCKET_BYTES) -> list[list[int]]:
@@ -41,10 +44,10 @@ def plan_buckets(items, bucket_bytes: int = BUCKET_BYTES) -> list[list[int]]:
 
 @torch.no_grad()
 def sync_weights(model: nn.Module, pg, src: int, version: int = 0, bucket_bytes: int = BUCKET_BYTES,
-                 sync_dtype: torch.dtype | None = None) -> dict:
+                 sync_dtype: torch.dtype | None = None, prefix: str | None = None) -> dict:
     """Broadcast `model`'s params from global rank `src`. Every rank of `pg` calls this with a model of identical
     structure. Returns {version, latency_ms, nbytes, n_buckets}; on receivers `version` is the sender's version."""
-    items = _items(model, sync_dtype)
+    items = _items(model, sync_dtype, prefix)
     if pg is None:  # non-source learner rank: only participate in the FSDP2 full_tensor() collectives
         for bucket in plan_buckets(items, bucket_bytes):
             for i in bucket:

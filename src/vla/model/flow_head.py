@@ -85,12 +85,75 @@ def flow_loss(dit: FlowDiT, actions, proprio, ctx, ctx_mask, t=None, noise=None)
 
 
 @torch.no_grad()
-def euler_sample(dit: FlowDiT, proprio, ctx, ctx_mask, steps: int = 10, noise=None):
+def euler_sample(dit: FlowDiT, proprio, ctx, ctx_mask, steps: int = 10, noise=None, ts=None):
+    """ODE Euler from t=1 (noise) to t=0. `ts` (len steps+1, decreasing) overrides the uniform grid."""
     b = proprio.shape[0]
     x = (torch.randn(b, dit.chunk, dit.act_dim, device=proprio.device, dtype=proprio.dtype) if noise is None
          else noise.clone().to(proprio.dtype))
-    dt = 1.0 / steps
-    for i in range(steps):
-        t = torch.full((b,), 1.0 - i * dt, device=proprio.device, dtype=proprio.dtype)
-        x = x - dt * dit(x, t, proprio, ctx, ctx_mask)
+    if ts is None:
+        ts = [1.0 - i / steps for i in range(steps + 1)]
+    for i in range(len(ts) - 1):
+        t = torch.full((b,), float(ts[i]), device=proprio.device, dtype=proprio.dtype)
+        x = x - (ts[i] - ts[i + 1]) * dit(x, t, proprio, ctx, ctx_mask)
     return x.clamp(-1, 1)
+
+
+# ------------------------------------------------------------------------------------------------ Flow-GRPO (SDE)
+# Convention (same as above): x_t = (1-t) x0 + t eps, v = eps - x0, t=1 is noise. Flow-GRPO (Liu et al. 2025) turns the
+# probability-flow ODE into the marginal-preserving reverse SDE
+#   dx = [v + sigma_t^2/(2t) (x + (1-t) v)] dt + sigma_t dw   (dt < 0),  sigma_t = a * sqrt(t / (1 - t)),
+# discretised with Euler-Maruyama over a grid of t values (decreasing, step h = t_i - t_{i+1} > 0):
+#   x_{i+1} = x_i - h [v + sigma^2/(2t) (x_i + (1-t) v)] + sigma sqrt(h) * z,   z ~ N(0, I)
+# so every step is Gaussian with a closed-form log-prob and KL. t=1 would give sigma=inf, so the grid starts at
+# 1 - delta (delta = 1/(2K)) with x_init = eps (approximation: the true marginal at 1-delta is
+# (delta x0 + (1-delta) eps)).
+
+def sde_grid(K: int, delta: float | None = None) -> list[float]:
+    delta = 1.0 / (2 * K) if delta is None else delta
+    return [(1 - delta) * (1 - i / K) for i in range(K + 1)]  # t_0 = 1-delta ... t_K = 0 (never evaluated at 0)
+
+
+def sde_sigma(t: float, a: float) -> float:
+    return a * (t / (1.0 - t)) ** 0.5
+
+
+def sde_step_stats(x, v, t: float, h: float, a: float):
+    """Gaussian transition N(mean, std^2 I) of one Euler-Maruyama step: returns (mean, std)."""
+    sig = sde_sigma(t, a)
+    mean = x - h * (v + (sig * sig / (2 * t)) * (x + (1 - t) * v))
+    return mean, sig * h ** 0.5
+
+
+def gaussian_logprob(x, mean, std: float):
+    """log N(x; mean, std^2 I) summed over the last two dims (chunk, act_dim) -> shape [B]."""
+    d = x[0].numel()
+    return (-0.5 * ((x - mean) / std) ** 2).sum((-2, -1)) - d * (torch.log(torch.tensor(std)) + 0.5 * math.log(2 * math.pi))
+
+
+def gaussian_kl(mean_p, mean_q, std: float):
+    """KL(N(mean_p, std^2) || N(mean_q, std^2)) summed over the last two dims: ||dmean||^2 / (2 std^2)."""
+    return ((mean_p - mean_q) ** 2).sum((-2, -1)) / (2 * std * std)
+
+
+@torch.no_grad()
+def flow_sde_sample(dit: FlowDiT, proprio, ctx, ctx_mask, K: int = 5, a: float = 0.7, generator=None, noise=None,
+                    ts=None):
+    """SDE rollout. Returns dict: actions (clamped final latent), x [B,K,H,A] (state BEFORE each step),
+    x_next [B,K,H,A], logp [B,K] (behaviour log-prob of each step), t list (len K), std list (len K)."""
+    b = proprio.shape[0]
+    dev, dt_ = proprio.device, proprio.dtype
+    x = (torch.randn(b, dit.chunk, dit.act_dim, device=dev, dtype=dt_, generator=generator) if noise is None
+         else noise.clone().to(dt_))
+    ts = sde_grid(K) if ts is None else ts
+    xs, xn, lps, stds = [], [], [], []
+    for i in range(K):
+        t, h = ts[i], ts[i] - ts[i + 1]
+        v = dit(x, torch.full((b,), t, device=dev, dtype=dt_), proprio, ctx, ctx_mask)
+        mean, std = sde_step_stats(x, v, t, h, a)
+        z = torch.randn(x.shape, device=dev, dtype=dt_, generator=generator)
+        x_next = mean + std * z if std > 0 else mean
+        lps.append(gaussian_logprob(x_next, mean, std) if std > 0 else torch.zeros(b, device=dev, dtype=dt_))
+        xs.append(x); xn.append(x_next); stds.append(std)
+        x = x_next
+    return {"actions": x.clamp(-1, 1), "x": torch.stack(xs, 1), "x_next": torch.stack(xn, 1),
+            "logp": torch.stack(lps, 1), "t": ts[:K], "std": stds}

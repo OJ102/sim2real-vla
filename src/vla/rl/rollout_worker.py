@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from vla.infer.engine import InferenceEngine
+from vla.infer.engine import make_engine
 from vla.model.prompts import encode_instructions
 from vla.rl.weight_sync import sync_weights
 from vla.sim.rewards import episode_return
@@ -35,7 +35,9 @@ def collect_batch(vec: SubprocVecEnv, engine: InferenceEngine, cfg, seeds: list[
         for i, (o, info) in zip(idx, vec.reset(idx, task, "train", [ep_seed[i] for i in idx])):
             obs[i], instr[i] = o, info["instruction"]
     active, acts, infos = set(range(n)), {i: [] for i in range(n)}, {i: [] for i in range(n)}
-    rec = {k: [] for k in ("image", "proprio", "bins", "logp", "ep")}
+    flow = engine.model.cfg.head == "flow"
+    keys = ("x", "x_next", "logp") if flow else ("bins", "logp")
+    rec = {k: [] for k in ("image", "proprio", "ep", *keys)}
     t0, env_steps, H = time.perf_counter(), 0, engine.model.cfg.chunk
     tok = engine.model.tokenizer
     while active:
@@ -50,7 +52,10 @@ def collect_batch(vec: SubprocVecEnv, engine: InferenceEngine, cfg, seeds: list[
         out = engine.generate(batch, generator=gen)
         chunk = out["actions"].float().cpu().numpy()
         rec["image"].append(batch["image"].cpu().numpy()); rec["proprio"].append(proprio)
-        rec["bins"].append(out["bins"].cpu().numpy()); rec["logp"].append(out["logp"].float().cpu().numpy())
+        for k in keys:
+            rec[k].append(out[k].float().cpu().numpy() if flow else out[k].cpu().numpy())
+        if flow:
+            t_grid, std_grid = np.array(out["t"], np.float64), np.array(out["std"], np.float64)
         rec["ep"].append(np.array(ids))
         for h in range(H):
             live = [i for i in ids if i in active]
@@ -73,9 +78,11 @@ def collect_batch(vec: SubprocVecEnv, engine: InferenceEngine, cfg, seeds: list[
     texts = [instr[i] for i in range(n)]
     ids_pad = encode_instructions(tok, texts)  # same left-padded layout the learner will rebuild from texts
     data = {"image": np.concatenate(rec["image"]), "proprio": np.concatenate(rec["proprio"]),
-            "bins": np.concatenate(rec["bins"]), "logp": np.concatenate(rec["logp"]), "ep": ep,
+            **{k: np.concatenate(rec[k]) for k in keys}, "ep": ep,
             "ep_return": np.array(R, np.float32), "ep_success": np.array(succ, np.float32),
             "ep_seed": np.array(ep_seed), "instr": np.array(texts), "group": np.arange(n) // G}
+    if flow:
+        data["t"], data["std"] = t_grid, std_grid
     for k in comps[0]:
         data[f"comp_{k}"] = np.array([c[k] for c in comps], np.float32)
     meta = {"env_steps": env_steps, "gen_time": gen_time}
@@ -86,14 +93,15 @@ def collect_batch(vec: SubprocVecEnv, engine: InferenceEngine, cfg, seeds: list[
 def rollout_loop(cfg, roles, rank: int, device, model, sync_pg, p_mean, p_std, shm: Path, log=print):
     vec = SubprocVecEnv(cfg.n_envs)
     n_img = (model.cfg.image_size // 16) ** 2
-    engine = InferenceEngine(model, cfg.temperature, cfg.engine_mode, max_prefix=n_img + 1 + cfg.max_prompt_tokens)
+    engine = make_engine(model, cfg.temperature, cfg.engine_mode, max_prefix=n_img + 1 + cfg.max_prompt_tokens,
+                         flow_K=cfg.flow_steps_rl, sde_a=cfg.flow_sde_a)
     gen = torch.Generator(device=device).manual_seed(cfg.seed * 7919 + rank)
     S, K = cfg.staleness, cfg.iterations
     ridx = roles.rollout_ranks.index(rank)
     idle = 0.0
     try:
         # initial sync: identical starting weights on all roles even without a shared init checkpoint
-        info = sync_weights(model, sync_pg, roles.sync_src, 0, sync_dtype=cfg.sync_dtype_t)
+        info = sync_weights(model, sync_pg, roles.sync_src, 0, sync_dtype=cfg.sync_dtype_t, prefix=cfg.sync_prefix)
         engine.version = info["version"]
         log(f"[rollout {rank}] initial sync v{engine.version} {info['latency_ms']:.0f} ms")
         for k in range(K):
@@ -112,7 +120,7 @@ def rollout_loop(cfg, roles, rank: int, device, model, sync_pg, p_mean, p_std, s
             idle = 0.0
             if k >= S:  # learner broadcasts after update j for j < K-S: exactly K-S syncs (k = S..K-1)
                 t0 = time.perf_counter()
-                info = sync_weights(model, sync_pg, roles.sync_src, 0, sync_dtype=cfg.sync_dtype_t)
+                info = sync_weights(model, sync_pg, roles.sync_src, 0, sync_dtype=cfg.sync_dtype_t, prefix=cfg.sync_prefix)
                 idle = time.perf_counter() - t0
                 engine.version = info["version"]
     finally:

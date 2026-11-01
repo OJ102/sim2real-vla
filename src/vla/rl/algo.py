@@ -32,14 +32,15 @@ def _masked_mean(x: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
 
 
 def grpo_loss(logp_new, logp_old, logp_beh, logp_ref, adv, mask=None, clip_eps: float = 0.2, beta: float = 0.02,
-              tis_cap: float = 2.0, use_tis: bool = True):
+              tis_cap: float = 2.0, use_tis: bool = True, kl=None):
     """All tensors [B, T] except adv [B] or [B, T] (episode advantage broadcast over tokens). Returns (loss, metrics)."""
     if adv.dim() == 1:
         adv = adv[:, None].expand_as(logp_new)
     ratio = torch.exp(logp_new - logp_old.detach())
     pg = torch.minimum(ratio * adv, ratio.clamp(1 - clip_eps, 1 + clip_eps) * adv)
     w = tis_weight(logp_old, logp_beh, tis_cap) if use_tis else torch.ones_like(ratio)
-    kl = kl_k3(logp_new, logp_ref.detach())
+    if kl is None:  # discrete tokens: k3 estimator; flow: pass the closed-form per-step Gaussian KL
+        kl = kl_k3(logp_new, logp_ref.detach())
     loss = _masked_mean(-pg * w + beta * kl, mask)
     with torch.no_grad():
         raw = torch.exp(logp_old - logp_beh)
