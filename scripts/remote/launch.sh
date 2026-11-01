@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Run a command in a detached tmux session, keeping its exit code and a per-run log.
-# Usage: bash scripts/remote/launch.sh <name> <cmd...>
+# Usage: bash scripts/remote/launch.sh <name> <cmd...>      (argv form)
+#        bash scripts/remote/launch.sh <name> "export X=1; uv run ..."   (single string form, run via bash -c)
 # Writes $VLA_RUNS/<name>/stdout.log and a copy $VLA_LOGS/<name>.log (default /dev/shm/$USER_vla_logs; survives a full home); stdout.log ends with "EXIT=<code> <timestamp>" (pipefail, PIPESTATUS).
 # A missing EXIT line means the process tree was SIGKILLed (OOM-killer / cgroup kill): see the header's memory limits.
 set -euo pipefail
@@ -24,8 +25,10 @@ RUNSH="$(dirname "$LOG2")/$NAME.run.sh"   # not on home: launching must work eve
   echo 'CG=/sys/fs/cgroup$(grep "^0::" /proc/self/cgroup | cut -c4-)'
   echo 'echo "cgroup=$CG memory.max=$(cat $CG/memory.max 2>/dev/null) memory.high=$(cat $CG/memory.high 2>/dev/null) pids.max=$(cat $CG/pids.max 2>/dev/null)" | $TEE "$LOG" "$LOG2" >/dev/null'
   echo 'echo "ulimit: $(ulimit -l) memlock, $(ulimit -n) nofile; shm: $(df -h /dev/shm | tail -1)" | $TEE "$LOG" "$LOG2" >/dev/null'
-  printf '%s' "$(printf '%q ' "$@")" > "$(dirname "$LOG2")/$NAME.cmd.txt"
-  echo "$(printf '%q ' "$@") 2>&1 | \$TEE \"\$LOG\" \"\$LOG2\""
+  # one argument = a shell command string (may contain `export X; uv run ...`): run it with bash -c; else exec argv as-is
+  if [ "$#" -eq 1 ]; then CMD="bash -c $(printf %q "$1")"; else CMD="$(printf '%q ' "$@")"; fi
+  printf '%s' "$CMD" > "$(dirname "$LOG2")/$NAME.cmd.txt"
+  echo "$CMD 2>&1 | \$TEE \"\$LOG\" \"\$LOG2\""
   echo 'rc=${PIPESTATUS[0]}'
   echo 'echo "EXIT=$rc $(date +%Y-%m-%dT%H:%M:%S%z)" | $TEE "$LOG" "$LOG2" >/dev/null'
 } > "$RUNSH"

@@ -16,3 +16,7 @@ num_workers: 2   # data_wait_s ~0.001 at 8; fewer workers = less host RAM (32 pr
 prefetch_factor: 4
 pg_timeout_min: 10
 hang_dump_s: 180      # dump all thread stacks to stdout if one step takes >3 min
+# throughput defaults from the 4-GPU sweep (baseline 137 -> 194 samples/s, 1.42x): regional compile + no reshard + prefetch
+compile_layers: true
+reshard_after_forward: false
+prefetch: true
