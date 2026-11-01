@@ -73,4 +73,38 @@ def test_stop_at_zero_runs_to_completion_and_keep_best(demos, tmp_path):
     sd = torch.load(d / "best.pt", map_location="cpu", weights_only=True)
     assert any(k.startswith("llm.") for k in sd)
     v = [r for r in recs(tmp_path, "full").values() if "val_main_loss" in r]
-    assert v and all(k in v[0] for k in ("val_main_loss", "val_ground_loss", "val_ground_err_cm", "val_ground_err_cm_t0"))
+    assert v and "val_main_loss" in v[0] and "val_ground_loss" not in v[0]          # no head -> no ground metrics
+
+
+def test_grounded_run_logs_ground_metrics_and_oversamples(demos, tmp_path):
+    run(demos, tmp_path, "gr", "steps=10", "val_every=5", "val_batches=1", "ground_weight=0.2", "early_k=4", "early_w=3")
+    rs = list(recs(tmp_path, "gr").values())
+    assert all("main_loss" in r and "ground_loss" in r and r["ground_loss"] >= 0 for r in rs)
+    v = [r for r in rs if "val_main_loss" in r]
+    assert v and all(k in v[0] for k in ("val_ground_loss", "val_ground_err_cm", "val_ground_err_cm_t0"))
+    assert all(r["loss"] == pytest.approx(r["main_loss"] + 0.2 * r["ground_loss"], rel=1e-3) for r in rs)
+    assert (tmp_path / "gr" / "final.pt").is_file() and (tmp_path / "gr" / "best.pt").is_file()
+
+
+def test_vla_ckpt_redirects_stop_and_best(demos, tmp_path):
+    import os
+    ck = tmp_path / "ck"
+    env_old = ENV.get("VLA_CKPT")
+    ENV["VLA_CKPT"] = str(ck)
+    try:
+        run(demos, tmp_path, "red", "steps=6", "stop_at=3", "val_every=3", "val_batches=1")
+        d = tmp_path / "red"
+        assert (ck / "red" / "stop_3.pt").is_file() and not (d / "stop_3.pt").exists() and not list(d.glob("stop_*.pt"))
+        assert (ck / "red" / "ckpt" / "latest").read_text().strip() == "step_000003"
+        run(demos, tmp_path, "red2", "steps=8", "val_every=4", "val_batches=1")
+        assert (ck / "red2" / "best.pt").is_file() and (tmp_path / "red2" / "best.pt").is_file()      # copy in the run dir
+        assert (tmp_path / "red2" / "final.pt").is_file() and not (ck / "red2" / "final.pt").exists()  # final.pt stays home
+        a = torch.load(ck / "red2" / "best.pt", map_location="cpu", weights_only=True)
+        b = torch.load(tmp_path / "red2" / "best.pt", map_location="cpu", weights_only=True)
+        assert a.keys() == b.keys() and all(torch.equal(a[k], b[k]) for k in a)
+        # stop_at run: best.pt copy lands in the run dir at stop time as well
+        assert (tmp_path / "red" / "best.pt").is_file() or not (ck / "red" / "best.pt").exists()
+    finally:
+        ENV.pop("VLA_CKPT", None)
+        if env_old:
+            ENV["VLA_CKPT"] = env_old
