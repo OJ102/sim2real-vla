@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+data/
+runs/
+*.h5
+*.pt
+.pytest_cache/
+results/demo/*.gif
+runs_pulled/
