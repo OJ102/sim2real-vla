@@ -37,7 +37,7 @@ class BCConfig:
     data_dir: str = ""                  # default $VLA_DATA/demos
     subset: str = ""                    # optional subset_{pct}.json
     runs_dir: str = ""                  # default $VLA_RUNS
-    backend: str = "fsdp"               # fsdp | ddp
+    backend: str = "fsdp"               # fsdp | ddp | deepspeed (ZeRO-3; throughput sweep only, no checkpoints)
     global_batch: int = 256
     micro_batch: int = 16               # per GPU; grad_accum = global_batch // (micro_batch * world)
     steps: int = 0                      # 0 => epochs * steps_per_epoch
@@ -63,6 +63,7 @@ class BCConfig:
     ckpt_dir: str = ""                  # default <run>/ckpt
     peak_tflops: float = 312.0          # A100 bf16
     export_final: bool = True
+    profile: bool = False               # torch.profiler: 5 warmup + 3 traced steps -> <run>/trace_rank<r>.json, then exit
     exit_after_step: int = 0            # test aid: hard-exit (like kill -9, no save/flush) after this step
 
 
@@ -110,6 +111,10 @@ def main():
         model = wrap_fsdp2(model, cfg.bf16, cfg.reshard_after_forward, cfg.prefetch, cfg.act_ckpt)
     elif cfg.backend == "ddp":
         model = wrap_ddp(model, local, cfg.act_ckpt)
+    elif cfg.backend == "deepspeed":
+        for m_ in (model.llm, model.vision):
+            if cfg.act_ckpt:
+                m_.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     else:
         raise ValueError(cfg.backend)
     base = unwrap(model)
@@ -119,6 +124,19 @@ def main():
     opt = torch.optim.AdamW([{"params": rest, "lr": cfg.lr}, {"params": vis, "lr": cfg.lr_vision}],
                             weight_decay=cfg.weight_decay, betas=(0.9, 0.95))
 
+    engine = None
+    if cfg.backend == "deepspeed":
+        import deepspeed
+
+        assert cfg.global_batch % (cfg.micro_batch * world) == 0
+        ds_cfg = {"train_micro_batch_size_per_gpu": cfg.micro_batch,
+                  "gradient_accumulation_steps": cfg.global_batch // (cfg.micro_batch * world),
+                  "bf16": {"enabled": cfg.bf16}, "gradient_clipping": cfg.grad_clip,
+                  "zero_optimization": {"stage": 3, "overlap_comm": True, "contiguous_gradients": True},
+                  "zero_allow_untested_optimizer": True, "steps_per_print": 10**9}
+        engine, opt, _, _ = deepspeed.initialize(model=model, optimizer=opt, config=ds_cfg)
+        model = engine
+        base = engine.module
     ds = VLADataset(data_dir, chunk=mcfg.chunk, part="train", subset=cfg.subset or None)
     val_ds = VLADataset(data_dir, chunk=mcfg.chunk, part="val")
     collate = make_collate(tok)
@@ -169,6 +187,14 @@ def main():
         model.train()
         return {"val_loss": (tot[0] / tot[2]).item(), "val_tok_acc": (tot[1] / tot[2]).item()}
 
+    prof = None
+    if cfg.profile:
+        from torch.profiler import ProfilerActivity, profile, schedule
+
+        acts = [ProfilerActivity.CPU] + ([ProfilerActivity.CUDA] if cuda else [])
+        prof = profile(activities=acts, schedule=schedule(wait=0, warmup=5, active=3),
+                       on_trace_ready=lambda p: p.export_chrome_trace(str(run / f"trace_rank{rank}.json")))
+        prof.start()
     flops_s = None
     stop = False
     t_prev = time.perf_counter()
@@ -185,6 +211,12 @@ def main():
             for mb in range(accum):
                 b = to_dev(next(it))
                 ctx = model.no_sync() if (cfg.backend == "ddp" and mb < accum - 1) else contextlib.nullcontext()
+                if engine is not None:  # DeepSpeed: engine owns scaling/accumulation/clipping/optimizer step
+                    out = model(b)
+                    model.backward(out["loss"])
+                    model.step()
+                    loss_acc += out["loss"].item() / accum
+                    continue
                 with ctx, (torch.autocast("cuda", dtype=torch.bfloat16) if (cuda and cfg.backend == "ddp" and cfg.bf16)
                            else contextlib.nullcontext()):
                     out = model(b)
@@ -194,11 +226,14 @@ def main():
             if flops_s is None:
                 n_img = (mcfg.image_size // 16) ** 2 if not mcfg.tiny else (mcfg.image_size // 16) ** 2
                 flops_s = flops_per_sample(base, n_img + 1 + b["input_ids"].shape[1] + base.n_act_tokens)
-            gn = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
-            for g, base_lr in zip(opt.param_groups, (cfg.lr, cfg.lr_vision)):
-                g["lr"] = base_lr * lr_at(step, total, cfg.warmup)
-            opt.step()
-            opt.zero_grad(set_to_none=True)
+            if engine is not None:
+                gn = engine.get_global_grad_norm() or 0.0
+            else:
+                gn = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+                for g, base_lr in zip(opt.param_groups, (cfg.lr, cfg.lr_vision)):
+                    g["lr"] = base_lr * lr_at(step, total, cfg.warmup)
+                opt.step()
+                opt.zero_grad(set_to_none=True)
             step += 1
             in_epoch += 1
             ckpt.poll()
@@ -209,7 +244,7 @@ def main():
             dt = time.perf_counter() - t0
 
             stall = 0.0
-            if step % cfg.ckpt_every == 0:
+            if step % cfg.ckpt_every == 0 and engine is None:
                 stall = ckpt.save(step, model, opt, extra())
             if step % cfg.log_every == 0 or step == total:
                 m = torch.tensor([loss_acc, acc_acc], device=device)
@@ -232,6 +267,14 @@ def main():
                 if rank == 0:
                     print(f"step {step}/{total} loss {rec['loss']:.4f} acc {rec['tok_acc']:.3f} "
                           f"{rec['samples_per_s']:.1f} samp/s mfu {rec['mfu']*100:.1f}%", flush=True)
+            if prof is not None:
+                prof.step()
+                if step >= 8:  # 5 warmup + 3 active
+                    prof.stop()
+                    if rank == 0:
+                        print(f"profile written: {run}/trace_rank0.json", flush=True)
+                    stop = True
+                    break
             if preempt.should_stop(device):
                 ckpt.save(step, model, opt, extra())
                 ckpt.wait()
@@ -243,10 +286,10 @@ def main():
             epoch, in_epoch = epoch + 1, 0
     ckpt.wait()
     if not stop:
-        if step % cfg.ckpt_every != 0:
+        if step % cfg.ckpt_every != 0 and engine is None:
             ckpt.save(step, model, opt, extra())
             ckpt.wait()
-        if cfg.export_final:
+        if cfg.export_final and engine is None:
             export_final(model, run / "final.pt")
     log.close()
     if dist.is_initialized():
