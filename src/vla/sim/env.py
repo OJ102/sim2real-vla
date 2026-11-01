@@ -9,7 +9,7 @@ import mujoco
 import numpy as np
 from gymnasium import spaces
 
-from .assets import (CAM_LOOKAT, CAM_NAME, CAM_POS, CAM_FOVY, CUBE_COLORS, CUBE_HALF, HOME_QPOS, N_LIGHTS,
+from .assets import (CAM_LOOKAT, CAM_NAME, CAM_POS, CAM_FOVY, CUBE_COLORS, CUBE_HALF, HOME_QPOS, N_LIGHTS, N_MATERIALS_TOTAL,
                      build_model, look_at_quat)
 from .ik import DLSIK
 from .randomization import DRConfig, DRParams, sample_dr
@@ -38,7 +38,7 @@ class TabletopEnv(gym.Env):
 
     def __init__(self, task: str = "lift", split: str = "train", image_size: int = 128, render_obs: bool = True,
                  dr_config: DRConfig | None = None):
-        assert task in TASKS and split in ("train", "heldout")
+        assert task in TASKS and split in ("train", "heldout", "heldout_photo")
         self.task, self.split, self.image_size, self.render_obs = task, split, image_size, render_obs
         self.dr_config = dr_config or DRConfig()
         self.model = build_model()
@@ -58,6 +58,8 @@ class TabletopEnv(gym.Env):
                            ["link1", "link2", "link3", "link4", "link5", "link6", "link7", "hand"]}
         self.finger_geoms = [g for g in range(m.ngeom) if m.body_parentid[m.geom_bodyid[g]] ==
                              nm(O.mjOBJ_BODY, "hand")]
+        # DR material index -> real mjModel material id (panda materials occupy the first ids)
+        self.mat_ids = [nm(O.mjOBJ_MATERIAL, f"mat{i}") for i in range(N_MATERIALS_TOTAL)]
         self.top_light = nm(O.mjOBJ_LIGHT, "top")
         self.lights = [nm(O.mjOBJ_LIGHT, f"light{i}") for i in range(N_LIGHTS)]
         # originals for DR restore
@@ -94,8 +96,8 @@ class TabletopEnv(gym.Env):
             m.light_active[l] = int(i < p.n_lights)
             m.light_dir[l] = p.light_dir[i]
             m.light_diffuse[l] = p.light_diffuse[i]
-        m.geom_matid[self.table_geom] = p.table_mat
-        m.geom_matid[self.floor_geom] = p.floor_mat
+        m.geom_matid[self.table_geom] = self.mat_ids[p.table_mat]
+        m.geom_matid[self.floor_geom] = self.mat_ids[p.floor_mat]
         for i, g in enumerate(self.cube_geom):
             m.geom_rgba[g, :3] = p.cube_rgb[i]
             m.geom_friction[g, 0] = p.friction
@@ -265,7 +267,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--demo", action="store_true")
     ap.add_argument("--task", default="lift", choices=TASKS)
-    ap.add_argument("--split", default="train")
+    ap.add_argument("--split", default="train", choices=["train", "heldout", "heldout_photo"])
     ap.add_argument("--episodes", type=int, default=3)
     ap.add_argument("--out", default="results/demo")
     a = ap.parse_args()

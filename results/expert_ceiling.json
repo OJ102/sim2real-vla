@@ -1,0 +1,121 @@
+{
+ "episodes": 100,
+ "seed0": 0,
+ "noise": 0.05,
+ "ceiling": {
+  "train": {
+   "reach": {
+    "successes": 100,
+    "ci95": [
+     0.9630051925239981,
+     0.9999999999999999
+    ],
+    "split": "train",
+    "seed0": 0,
+    "success": 1.0,
+    "mean_steps": 21.25,
+    "episodes": 100
+   },
+   "lift": {
+    "successes": 100,
+    "ci95": [
+     0.9630051925239981,
+     0.9999999999999999
+    ],
+    "split": "train",
+    "seed0": 0,
+    "success": 1.0,
+    "mean_steps": 32.24,
+    "episodes": 100
+   },
+   "push": {
+    "successes": 99,
+    "ci95": [
+     0.9455124752390653,
+     0.9982326134344526
+    ],
+    "split": "train",
+    "seed0": 0,
+    "success": 0.99,
+    "mean_steps": 33.06,
+    "episodes": 100
+   }
+  },
+  "heldout": {
+   "reach": {
+    "successes": 100,
+    "ci95": [
+     0.9630051925239981,
+     0.9999999999999999
+    ],
+    "split": "heldout",
+    "seed0": 0,
+    "success": 1.0,
+    "mean_steps": 21.83,
+    "episodes": 100
+   },
+   "lift": {
+    "successes": 90,
+    "ci95": [
+     0.8256326956323347,
+     0.9447714583868639
+    ],
+    "split": "heldout",
+    "seed0": 0,
+    "success": 0.9,
+    "mean_steps": 40.19,
+    "episodes": 100
+   },
+   "push": {
+    "successes": 73,
+    "ci95": [
+     0.6356769977376873,
+     0.8073053908233518
+    ],
+    "split": "heldout",
+    "seed0": 0,
+    "success": 0.73,
+    "mean_steps": 51.97,
+    "episodes": 100
+   }
+  },
+  "heldout_photo": {
+   "reach": {
+    "successes": 100,
+    "ci95": [
+     0.9630051925239981,
+     0.9999999999999999
+    ],
+    "split": "heldout_photo",
+    "seed0": 0,
+    "success": 1.0,
+    "mean_steps": 21.83,
+    "episodes": 100
+   },
+   "lift": {
+    "successes": 90,
+    "ci95": [
+     0.8256326956323347,
+     0.9447714583868639
+    ],
+    "split": "heldout_photo",
+    "seed0": 0,
+    "success": 0.9,
+    "mean_steps": 40.19,
+    "episodes": 100
+   },
+   "push": {
+    "successes": 73,
+    "ci95": [
+     0.6356769977376873,
+     0.8073053908233518
+    ],
+    "split": "heldout_photo",
+    "seed0": 0,
+    "success": 0.73,
+    "mean_steps": 51.97,
+    "episodes": 100
+   }
+  }
+ }
+}

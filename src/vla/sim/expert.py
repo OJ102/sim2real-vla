@@ -89,12 +89,24 @@ def run_episode(env: TabletopEnv, seed: int, noise: float = 0.05) -> dict:
     return {"success": bool(info["success"]), "steps": info["step"]}
 
 
+def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    if n == 0:
+        return (0.0, 1.0)
+    p = k / n
+    d = 1 + z * z / n
+    c = (p + z * z / (2 * n)) / d
+    h = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
+    return (float(max(0.0, c - h)), float(min(1.0, c + h)))
+
+
 def evaluate(episodes: int, split: str, seed0: int = 0, tasks=TASKS, render_obs: bool = False) -> dict:
     out = {}
     for task in tasks:
         env = TabletopEnv(task=task, split=split, render_obs=render_obs)
         res = [run_episode(env, seed0 + i) for i in range(episodes)]
-        out[task] = {"success": float(np.mean([r["success"] for r in res])),
+        k = int(sum(r["success"] for r in res))
+        out[task] = {"successes": k, "ci95": wilson(k, episodes), "split": split, "seed0": seed0,
+                     "success": float(np.mean([r["success"] for r in res])),
                      "mean_steps": float(np.mean([r["steps"] for r in res])), "episodes": episodes}
         print(f"{task}: success={out[task]['success']:.3f} mean_steps={out[task]['mean_steps']:.1f} "
               f"(n={episodes}, split={split})", flush=True)
@@ -105,12 +117,13 @@ def evaluate(episodes: int, split: str, seed0: int = 0, tasks=TASKS, render_obs:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--episodes", type=int, default=100)
-    ap.add_argument("--split", default="train")
+    ap.add_argument("--split", default="train", help="train|heldout|heldout_photo|all|comma list")
     ap.add_argument("--tasks", default=",".join(TASKS))
     ap.add_argument("--seed0", type=int, default=0)
     ap.add_argument("--render", action="store_true", help="render images too (slower; needed to test EGL)")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
-    res = evaluate(a.episodes, a.split, a.seed0, a.tasks.split(","), a.render)
+    splits = ["train", "heldout", "heldout_photo"] if a.split == "all" else a.split.split(",")
+    res = {sp: evaluate(a.episodes, sp, a.seed0, a.tasks.split(","), a.render) for sp in splits}
     if a.out:
-        json.dump(res, open(a.out, "w"), indent=1)
+        json.dump({"episodes": a.episodes, "seed0": a.seed0, "noise": 0.05, "ceiling": res}, open(a.out, "w"), indent=1)
