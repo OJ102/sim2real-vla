@@ -12,7 +12,7 @@ from gymnasium import spaces
 from .assets import (CAM_LOOKAT, CAM_NAME, CAM_POS, CAM_FOVY, CUBE_COLORS, CUBE_HALF, HOME_QPOS, N_LIGHTS, N_MATERIALS_TOTAL,
                      build_model, look_at_quat)
 from .ik import DLSIK
-from .randomization import DRConfig, DRParams, sample_dr
+from .randomization import DRConfig, DRParams, nominalize, sample_dr
 from .rewards import is_success
 
 TASKS = ("reach", "lift", "push")
@@ -47,9 +47,11 @@ class TabletopEnv(gym.Env):
     metadata = {"render_modes": ["rgb_array"], "render_fps": 10}
 
     def __init__(self, task: str = "lift", split: str = "train", image_size: int = 128, render_obs: bool = True,
-                 dr_config: DRConfig | None = None, allow_missing_dtd: bool = False):
+                 dr_config: DRConfig | None = None, allow_missing_dtd: bool = False,
+                 dr_nominal: tuple = ()):
         assert task in TASKS and split in ("train", "heldout", "heldout_photo")
         self.task, self.split, self.image_size, self.render_obs = task, split, image_size, render_obs
+        self.dr_nominal = tuple(dr_nominal)  # DR groups (cam|vis|phys) fixed at nominal (ablation datasets)
         self.dr_config = dr_config or DRConfig()
         self.model = build_model(allow_missing_dtd)
         self.data = mujoco.MjData(self.model)
@@ -155,8 +157,12 @@ class TabletopEnv(gym.Env):
         super().reset(seed=seed)
         rng = np.random.default_rng(seed) if seed is not None else self.np_random
         self.dr = sample_dr(self.split, rng, self.dr_config)
+        if self.dr_nominal:
+            self.dr = nominalize(self.dr, self.dr_nominal)
         self._apply_dr(self.dr)
         self.target_idx = int(rng.integers(3))
+        if options and "target_idx" in options:  # force target colour (RNG stream unchanged)
+            self.target_idx = int(options["target_idx"])
         self.target_color = CUBE_COLORS[self.target_idx]
         xy, goal = self._sample_layout(rng)
         self.goal_xy = goal

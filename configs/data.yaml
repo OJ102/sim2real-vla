@@ -1,0 +1,11 @@
+# out_dir defaults to $VLA_DATA/demos (set VLA_DATA in .env). Server: /dev/shm/... (RAM, regenerable).
+tasks: [reach, lift, push]
+colors: [red, green, blue]
+episodes_per_combo: 1000     # per (task, colour): 3*3*1000 = 9000 episodes
+chunk_size: 50               # episodes per shard / per worker job
+seed_base: 100000            # train-data seeds; eval seeds live below this (0..99999)
+split: train
+dr_nominal: []               # ablations: [cam] | [vis] | [phys]
+expert_noise: 0.05
+image_size: 128
+max_attempt_factor: 2.0      # give up on a chunk after this many x attempts

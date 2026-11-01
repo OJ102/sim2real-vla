@@ -139,3 +139,35 @@ def sample_dr(split: str, rng: np.random.Generator, cfg: DRConfig | None = None)
         rgb.append(j)
     return DRParams(cam_pos, cam_look, fov, n_lights, d, az, el, diffuse, table_mat, floor_mat, np.array(rgb),
                     float(friction), float(mass), kp)
+
+
+NOMINAL_GROUPS = ("cam", "vis", "phys")
+
+
+def nominalize(p: DRParams, groups) -> DRParams:
+    """Fix whole DR groups at nominal values (ablation datasets). Applied AFTER sampling, so the RNG stream
+    (and hence layouts) is identical to the un-ablated dataset with the same seed.
+    cam: camera pose/fov. vis: lighting, table/floor textures, cube colour jitter. phys: friction, mass, kp."""
+    import copy
+
+    p = copy.deepcopy(p)
+    groups = set(groups)
+    unknown = groups - set(NOMINAL_GROUPS)
+    if unknown:
+        raise ValueError(f"unknown DR groups {unknown}; choose from {NOMINAL_GROUPS}")
+    if "cam" in groups:
+        p.cam_pos_offset = np.zeros(3)
+        p.cam_look_offset = np.zeros(3)
+        p.cam_fov_delta = 0.0
+    if "vis" in groups:
+        p.n_lights = 2
+        p.light_az = np.zeros(N_LIGHTS)
+        p.light_el = np.full(N_LIGHTS, np.radians(60.0))
+        p.light_dir = -np.stack([np.cos(p.light_el) * np.cos(p.light_az), np.cos(p.light_el) * np.sin(p.light_az),
+                                 np.sin(p.light_el)], axis=1)
+        p.light_diffuse = np.full(N_LIGHTS, 0.7)
+        p.table_mat, p.floor_mat = 1, 0
+        p.cube_rgb = np.array([CUBE_BASE_RGB[c] for c in CUBE_COLORS])
+    if "phys" in groups:
+        p.friction, p.cube_mass, p.kp_scale = 0.9, 0.1, np.ones(7)
+    return p
