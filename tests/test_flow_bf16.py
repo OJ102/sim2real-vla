@@ -55,8 +55,8 @@ def test_flow_engine_and_rl_logp_bf16(m):
     with torch.no_grad():
         o = m({**b, "x": r["x"], "x_next": r["x_next"], "t": r["t"], "sde_a": 0.7})
     assert o["logp"].shape == (3, 3) and torch.isfinite(o["logp"]).all()
-    # bf16 resolves ~3 digits and |logp| is ~5-25 here, so 1e-2 absolute is below one bf16 ulp (0.06-0.125)
-    assert torch.allclose(o["logp"].float(), r["logp"].float(), atol=0.1, rtol=1e-2), (o["logp"] - r["logp"].float()).abs().max()
+    assert r["logp"].dtype == torch.float32 and o["logp"].dtype == torch.float32      # SDE chain/logp kept in fp32
+    assert torch.allclose(o["logp"], r["logp"], atol=1e-2, rtol=1e-3), (o["logp"] - r["logp"]).abs().max()
 
 
 def test_euler_sample_fp32_noise_with_bf16_params(m):
