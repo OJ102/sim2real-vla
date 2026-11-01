@@ -7,7 +7,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from vla.sim.assets import CUBE_COLORS, HELDOUT_MATS, TRAIN_MATS
+import mujoco
+
+from vla.sim.assets import CUBE_COLORS, HELDOUT_MATS, HELDOUT_PHOTO_MATS, TRAIN_MATS
 from vla.sim.env import MAX_STEPS, TabletopEnv
 from vla.sim.randomization import DRConfig, sample_dr
 
@@ -81,6 +83,10 @@ def test_different_seeds_differ(env):
     assert len({s["img"].tobytes() for s in seen}) == len(seen)
 
 
+def _matname(m, geom):
+    return mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_MATERIAL, int(m.geom_matid[geom]))
+
+
 def test_dr_is_applied_to_model_at_every_reset(env):
     """info['dr'] must match the actual mjModel after reset (not only at construction)."""
     for s in (1, 2, 3):
@@ -88,7 +94,7 @@ def test_dr_is_applied_to_model_at_every_reset(env):
         p, m = env.dr, env.model
         assert np.allclose(m.cam_fovy[env.cam], 50.0 + p.cam_fov_delta)
         assert np.allclose(m.cam_pos[env.cam], np.array([1.0, 0.0, 0.45]) + p.cam_pos_offset)
-        assert m.geom_matid[env.table_geom] == p.table_mat and m.geom_matid[env.floor_geom] == p.floor_mat
+        assert _matname(m, env.table_geom) == f"mat{p.table_mat}" and _matname(m, env.floor_geom) == f"mat{p.floor_mat}"
         for i in range(3):
             assert m.body_mass[env.cube_body[i]] == pytest.approx(p.cube_mass)
             assert m.geom_friction[env.cube_geom[i], 0] == pytest.approx(p.friction)
@@ -111,6 +117,16 @@ def _bands(v, train, held):
     return train[0] <= v <= train[1], any(a < v <= b for a, b in held)
 
 
+def _light_ok_train(az, el):
+    return abs(az) <= 60 and 45 <= el <= 75
+
+
+def _light_ok_held(az, el):
+    side = 90 < abs(az) <= 180 and 45 <= el <= 75
+    low = abs(az) <= 60 and 20 <= el <= 40
+    return side or low
+
+
 def test_train_samples_inside_train_range():
     cfg = DRConfig()
     for s in range(200):
@@ -120,17 +136,20 @@ def test_train_samples_inside_train_range():
         assert abs(p.cam_fov_delta) <= cfg.cam_fov
         assert np.all((p.light_diffuse >= 0.4) & (p.light_diffuse <= 1.0))
         assert 0.6 <= p.friction <= 1.2 and 0.05 <= p.cube_mass <= 0.2
-        assert p.table_mat in range(0, 8) and p.floor_mat in range(0, 8)
+        assert p.table_mat in TRAIN_MATS and p.floor_mat in TRAIN_MATS
+        assert p.table_mat < 42 and p.floor_mat < 42
         assert 1 <= p.n_lights <= 3
         assert np.all(np.abs(p.kp_scale - 1) <= 0.1)
+        for az, el in zip(np.degrees(p.light_az), np.degrees(p.light_el)):  # all 3 lights
+            assert _light_ok_train(az, el), (s, az, el)
 
 
-def test_heldout_samples_outside_train_range():
+@pytest.mark.parametrize("split", ["heldout", "heldout_photo"])
+def test_heldout_samples_outside_train_range(split):
     cfg = DRConfig()
     for s in range(200):
-        p = sample_dr("heldout", np.random.default_rng(s), cfg)
+        p = sample_dr(split, np.random.default_rng(s), cfg)
         assert not cfg.in_train_range(p)
-        # every param individually outside the train range, inside the wider held-out band
         assert np.all((np.abs(p.cam_pos_offset) > 0.03) & (np.abs(p.cam_pos_offset) <= 0.06)), s
         assert np.all((np.abs(p.cam_look_offset) > 0.02) & (np.abs(p.cam_look_offset) <= 0.04)), s
         assert 4 < abs(p.cam_fov_delta) <= 8, s
@@ -138,26 +157,82 @@ def test_heldout_samples_outside_train_range():
             assert (0.15 <= d < 0.4) or (1.0 < d <= 1.4), (s, d)
         assert (0.3 <= p.friction < 0.6) or (1.2 < p.friction <= 1.8), s
         assert 0.2 < p.cube_mass <= 0.4, s
-        assert p.table_mat in range(8, 12) and p.floor_mat in range(8, 12)
+        # kp: all 7 strictly outside train, inside wider band
+        dk = np.abs(p.kp_scale - 1)
+        assert np.all((dk > 0.10) & (dk <= 0.25)), (s, dk)
+        # light direction: first n_lights AND all 3
+        az, el = np.degrees(p.light_az), np.degrees(p.light_el)
+        assert az.shape == (3,) and el.shape == (3,)
+        for i in range(3):
+            assert _light_ok_held(az[i], el[i]), (s, i, az[i], el[i])
+            assert not _light_ok_train(az[i], el[i]), (s, i, az[i], el[i])
+        # light_dir unit, downward
+        assert np.allclose(np.linalg.norm(p.light_dir, axis=1), 1) and np.all(p.light_dir[:, 2] < 0)
         assert p.table_mat != p.floor_mat
-        assert np.all(np.abs(p.kp_scale - 1) <= 0.1)
+        if split == "heldout":
+            assert p.table_mat in HELDOUT_MATS and p.floor_mat in HELDOUT_MATS
+        else:
+            assert p.table_mat in HELDOUT_PHOTO_MATS and p.floor_mat in HELDOUT_PHOTO_MATS
+            assert p.table_mat >= 42 and p.floor_mat >= 42
 
 
 def test_material_id_sets_disjoint():
-    assert set(TRAIN_MATS) == set(range(8)) and set(HELDOUT_MATS) == set(range(8, 12))
+    assert set(HELDOUT_MATS) == set(range(8, 12))
+    assert set(HELDOUT_PHOTO_MATS) == set(range(42, 59))
+    assert set(TRAIN_MATS) == set(range(8)) | set(range(12, 42))
+    assert not set(TRAIN_MATS) & set(HELDOUT_MATS)
+    assert not set(TRAIN_MATS) & set(HELDOUT_PHOTO_MATS)
+    assert not set(HELDOUT_MATS) & set(HELDOUT_PHOTO_MATS)
 
 
-def test_heldout_env_applies_heldout_params():
-    e = TabletopEnv("lift", "heldout")
+def test_heldout_photo_never_uses_train_or_procedural_ids():
+    for s in range(300):
+        p = sample_dr("heldout_photo", np.random.default_rng(s))
+        assert min(p.table_mat, p.floor_mat) >= 42
+        q = sample_dr("train", np.random.default_rng(s))
+        assert max(q.table_mat, q.floor_mat) < 42
+        h = sample_dr("heldout", np.random.default_rng(s))
+        assert max(h.table_mat, h.floor_mat) < 12 and min(h.table_mat, h.floor_mat) >= 8
+
+
+@pytest.mark.parametrize("split", ["heldout", "heldout_photo"])
+def test_heldout_env_applies_heldout_params(split):
+    e = TabletopEnv("lift", split)
     try:
         for s in range(5):
             e.reset(seed=s)
-            m = e.model
-            assert m.geom_matid[e.table_geom] in range(8, 12) and m.geom_matid[e.floor_geom] in range(8, 12)
-            assert not DRConfig().in_train_range(e.dr)
+            m, p = e.model, e.dr
+            assert not DRConfig().in_train_range(p)
+            assert _matname(m, e.table_geom) == f"mat{p.table_mat}"
+            assert _matname(m, e.floor_geom) == f"mat{p.floor_mat}"
             assert m.body_mass[e.cube_body[0]] > 0.2
+            # kp actually written to model
+            assert np.allclose(m.actuator_gainprm[:7, 0], e._orig["actuator_gainprm"][:7, 0] * p.kp_scale)
+            # light dir actually written to model
+            for i in range(3):
+                assert np.allclose(m.light_dir[e.lights[i]], p.light_dir[i], atol=1e-6)
     finally:
         e.close()
+
+
+def test_light_dir_changes_image_and_model_per_seed(env):
+    dirs = []
+    for s in range(4):
+        env.reset(seed=s)
+        dirs.append(env.model.light_dir[env.lights[0]].copy())
+    assert len({tuple(np.round(d, 6)) for d in dirs}) == 4
+
+
+def test_expert_ceiling_json():
+    p = ROOT / "results" / "expert_ceiling.json"
+    assert p.is_file()
+    c = json.loads(p.read_text())["ceiling"]
+    assert set(c) >= {"train", "heldout", "heldout_photo"}
+    for split in ("train", "heldout", "heldout_photo"):
+        for t in ("reach", "lift", "push"):
+            r = c[split][t]
+            assert 0 <= r["success"] <= 1 and len(r["ci95"]) == 2
+            assert r["ci95"][0] <= r["success"] <= r["ci95"][1] + 1e-9
 
 
 def test_unknown_split_raises():
@@ -320,3 +395,50 @@ def test_cu130_index_pinned_for_linux():
     py = (ROOT / "pyproject.toml").read_text()
     assert "download.pytorch.org/whl/cu130" in py
     assert re.search(r"torch\s*=\s*\[\{[^}]*pytorch-cu130[^}]*sys_platform == 'linux'", py)
+
+
+# ------------------------------------------------------------ semantic material checks (resolve names, not ids)
+def _dtd_class(name):
+    """'mat{i}' -> DTD class index (i-12) for photo mats, None for procedural mats 0-11."""
+    assert re.fullmatch(r"mat\d+", name), name
+    i = int(name[3:])
+    return i - 12 if i >= 12 else None
+
+
+@pytest.mark.parametrize("split", ["train", "heldout", "heldout_photo"])
+def test_material_names_per_split(split):
+    e = TabletopEnv("lift", split, render_obs=False)
+    try:
+        for s in range(40):
+            e.reset(seed=s)
+            for g in (e.table_geom, e.floor_geom):
+                name = _matname(e.model, g)
+                assert name is not None and re.fullmatch(r"mat\d+", name), name  # never a Panda material
+                i, k = int(name[3:]), _dtd_class(name)
+                if split == "train":
+                    assert i < 8 or (k is not None and 0 <= k <= 29), name
+                elif split == "heldout":
+                    assert 8 <= i <= 11, name
+                else:
+                    assert k is not None and 30 <= k <= 46, name
+    finally:
+        e.close()
+
+
+def test_panda_materials_never_reassigned():
+    e = TabletopEnv("lift", "train", render_obs=False)
+    try:
+        base = e.model.geom_matid.copy()
+        free = {e.table_geom, e.floor_geom}
+        for s in range(10):
+            e.reset(seed=s)
+            diff = {int(g) for g in np.nonzero(e.model.geom_matid != base)[0]}
+            assert diff <= free, diff
+        panda = {mujoco.mj_id2name(e.model, mujoco.mjtObj.mjOBJ_MATERIAL, int(i)) for i in base if i >= 0} - {None}
+        assert panda - {f"mat{i}" for i in range(59)}, "expected Panda-own materials to exist"
+        for g in range(e.model.ngeom):
+            if g not in free and base[g] >= 0:
+                n = mujoco.mj_id2name(e.model, mujoco.mjtObj.mjOBJ_MATERIAL, int(base[g]))
+                assert not re.fullmatch(r"mat\d+", n or ""), (g, n)  # DR mats only on table/floor
+    finally:
+        e.close()
