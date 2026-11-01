@@ -105,6 +105,7 @@ def run_job(job: dict) -> dict:
         obs, info = env.reset(seed=seed, options={"target_idx": tidx})
         ex = ScriptedExpert(job["task"], np.random.default_rng(10_000_000 + seed), cfg.expert_noise)
         imgs, pro, acts, done = [obs["image"]], [obs["proprio"]], [], False
+        cps = [env.privileged()["cube_pos"]]  # world positions of all 3 cubes, aligned with images[row]
         while not done:
             a = ex.act(env)
             obs, _, term, trunc, info = env.step(a)
@@ -113,10 +114,11 @@ def run_job(job: dict) -> dict:
             if not done:
                 imgs.append(obs["image"])
                 pro.append(obs["proprio"])
+                cps.append(env.privileged()["cube_pos"])
         attempts += 1
         if info["success"]:
             eps.append({"images": np.stack(imgs), "proprio": np.stack(pro), "actions": np.stack(acts)[: len(imgs)],
-                        "seed": seed, "instruction": info["instruction"]})
+                        "cube_pos": np.stack(cps).astype(np.float32), "seed": seed, "instruction": info["instruction"]})
         seed += 1
     out = resolve_out_dir(cfg)
     out.mkdir(parents=True, exist_ok=True)
@@ -133,6 +135,8 @@ def run_job(job: dict) -> dict:
                 im[s0:s0 + ln] = e["images"]
             f["proprio"] = np.concatenate([e["proprio"] for e in eps]).astype(np.float32)
             f["actions"] = np.concatenate([e["actions"] for e in eps]).astype(np.float32)
+            f["cube_pos"] = np.concatenate([e["cube_pos"] for e in eps]).astype(np.float32)  # [N,3,3]
+            f["target_idx"] = np.full(len(eps), tidx, dtype=np.int64)
             f["ep_start"], f["ep_len"] = starts.astype(np.int64), lens.astype(np.int64)
             f["seed"] = np.array([e["seed"] for e in eps], dtype=np.int64)
             dt = h5py.string_dtype()
@@ -148,14 +152,26 @@ def run_job(job: dict) -> dict:
 def compute_stats(out: Path, shards: list[str]) -> dict:
     import h5py
 
-    pro, n = [], 0
+    pro, txy, n, missing = [], [], 0, 0
     for s in shards:
         with h5py.File(out / s, "r") as f:
             pro.append(f["proprio"][:])
             n += len(pro[-1])
+            if "cube_pos" in f and "target_idx" in f:
+                cp, ti = f["cube_pos"][:], f["target_idx"][:]
+                for st, ln, k in zip(f["ep_start"][:], f["ep_len"][:], ti):
+                    txy.append(cp[st:st + ln, k, :2])
+            else:
+                missing += 1
     p = np.concatenate(pro)
-    return {"n_frames": n, "proprio_mean": p.mean(0).tolist(), "proprio_std": (p.std(0) + 1e-6).tolist(),
-            "action_low": -1.0, "action_high": 1.0}
+    st = {"n_frames": n, "proprio_mean": p.mean(0).tolist(), "proprio_std": (p.std(0) + 1e-6).tolist(),
+          "action_low": -1.0, "action_high": 1.0}
+    if txy and not missing:
+        t = np.concatenate(txy)
+        st["target_xy_mean"], st["target_xy_std"] = t.mean(0).tolist(), (t.std(0) + 1e-6).tolist()
+    elif missing:
+        print(f"WARNING: {missing} shard(s) lack cube_pos/target_idx: target_xy stats skipped", flush=True)
+    return st
 
 
 def write_subsets(out: Path, shards: list[str], fracs=(10, 30, 100)) -> None:

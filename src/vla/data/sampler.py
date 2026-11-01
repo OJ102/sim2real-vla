@@ -12,7 +12,19 @@ from torch.utils.data import Sampler
 
 class ResumableDistributedSampler(Sampler):
     def __init__(self, n: int, rank: int = 0, world_size: int = 1, seed: int = 0, epoch: int = 0, consumed: int = 0,
-                 shuffle: bool = True):
+                 shuffle: bool = True, repeats=None):
+        """repeats: optional int array [n] (>=1): index i appears repeats[i] times in the epoch (integer oversampling).
+        Expanded list = concat(arange(n), idx where repeats>=2, idx where repeats>=3, ...); `n` below (and in
+        state_dict) is the EXPANDED length. repeats=None is exactly the previous behaviour."""
+        self.base = None
+        if repeats is not None:
+            import numpy as np
+
+            r = np.asarray(repeats)
+            assert len(r) == n and r.min() >= 1
+            parts = [np.arange(n)] + [np.nonzero(r >= k)[0] for k in range(2, int(r.max()) + 1)]
+            self.base = torch.from_numpy(np.concatenate(parts))
+            n = len(self.base)
         self.n, self.rank, self.world_size, self.seed, self.epoch = n, rank, world_size, seed, epoch
         self.consumed, self.shuffle = consumed, shuffle
         self.num_per_rank = n // world_size  # drop the tail so all ranks do equal work
@@ -24,7 +36,10 @@ class ResumableDistributedSampler(Sampler):
             idx = torch.randperm(self.n, generator=g).tolist()
         else:
             idx = list(range(self.n))
-        return idx[: self.num_per_rank * self.world_size][self.rank::self.world_size]
+        idx = idx[: self.num_per_rank * self.world_size][self.rank::self.world_size]
+        if self.base is not None:
+            idx = self.base[torch.as_tensor(idx, dtype=torch.long)].tolist()
+        return idx
 
     def __iter__(self):
         idx = self._indices()
