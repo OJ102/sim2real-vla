@@ -52,37 +52,26 @@ for i in range(n):
 if n == 0 or bad:
     print("ERROR: no devices or a visible device is not an A100 (check CUDA_VISIBLE_DEVICES in .env)")
     sys.exit(1)
-import subprocess
-from vla.sim.egl import map_devices
-try:
-    rows = map_devices()
-    n_egl = len(rows)
-except Exception as e:  # mapping failed: still probe a generous range
-    print(f"EGL->GPU mapping unavailable ({e}); probing ids 0..15")
-    rows, n_egl = [], 16
-# every EGL device is rendered in its own subprocess; GL_RENDERER must contain NVIDIA (llvmpipe etc. = failed)
-code = ("from vla.sim.env import TabletopEnv; from vla.sim.egl import gl_renderer\n"
-        "e=TabletopEnv('lift','train',allow_missing_dtd=True)\n"  # probe tests GL only; DTD is checked separately
-        "s=e.reset(seed=0)[0]['image'].shape; print(s, '|', gl_renderer())")
-ok = []
-for dev in range(n_egl):
-    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
-                       env={**os.environ, "MUJOCO_EGL_DEVICE_ID": str(dev)})
-    last = r.stdout.strip().splitlines()[-1] if r.returncode == 0 and r.stdout.strip() else ""
-    gpu = rows[dev]["gpu_name"] if dev < len(rows) else None
-    if "|" in last:
-        shape, renderer = (x.strip() for x in last.split("|", 1))
-        good = "NVIDIA" in renderer
-        print(f"  EGL id {dev} [{gpu}]: render {shape} GL_RENDERER={renderer!r} -> {'OK' if good else 'REJECTED (not NVIDIA)'}")
-        if good:
-            ok.append(dev)
-    else:
-        err = (r.stderr.strip().splitlines() or ["?"])[-1][:120]
-        print(f"  EGL id {dev} [{gpu}]: FAILED ({err})")
-print(f"MUJOCO_GL={os.environ.get('MUJOCO_GL')} working NVIDIA EGL ids: {ok}")
-a100 = [r["egl_id"] for r in rows if r["gpu_name"] and "A100" in r["gpu_name"]]
-rec = [d for d in a100 if d in ok] if rows else ok
-print(f"recommended VLA_EGL_DEVICES={','.join(map(str, rec))}  (A100 + NVIDIA renderer; put in .env, or leave unset to auto-pick)")
+from vla.sim.egl import map_devices, probe_mujoco_ids, recommended_ids
+try:  # informational only: raw eglQueryDevicesEXT list does not match MuJoCo's ids
+    for r in map_devices():
+        print(f"  raw EGL {r['egl_id']}: drm={r['drm']} pci={r['pci']} -> {r['gpu_name'] or 'unknown'}")
+except Exception as e:
+    print(f"  raw EGL->GPU table unavailable ({str(e)[:80]})")
+# ground truth: render in a subprocess for every MUJOCO_EGL_DEVICE_ID and read GL_RENDERER
+probe = probe_mujoco_ids(16)
+for d, r in probe.items():
+    print(f"  MUJOCO_EGL_DEVICE_ID={d}: {r or 'cannot initialise'}")
+rec = recommended_ids(probe)
+print(f"MUJOCO_GL={os.environ.get('MUJOCO_GL')} A100 MuJoCo EGL ids: {rec}")
+print(f"recommended VLA_EGL_DEVICES={','.join(map(str, rec))}  (put in .env, or leave unset to auto-probe)")
 if not rec:
-    sys.exit("ERROR: no usable NVIDIA EGL device on an A100")
+    sys.exit("ERROR: no MuJoCo EGL device renders on an A100")
+env_ids = [int(x) for x in os.environ.get("VLA_EGL_DEVICES", "").split(",") if x.strip()]
+if env_ids and not set(env_ids) <= set(rec):
+    print(f"WARN: VLA_EGL_DEVICES={env_ids} in .env includes non-A100 ids; recommended {rec}")
+from vla.sim.env import TabletopEnv
+os.environ["MUJOCO_EGL_DEVICE_ID"] = str(rec[0])
+env = TabletopEnv("lift", "train", allow_missing_dtd=True)  # GL check only
+print("egl render ok", env.reset(seed=0)[0]["image"].shape)
 PY

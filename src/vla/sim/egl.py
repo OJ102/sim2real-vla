@@ -63,12 +63,29 @@ def map_devices() -> list[dict]:
     return rows
 
 
-def recommended_ids() -> list[int]:
-    """EGL ids that map to an A100 ([] if the mapping cannot be determined)."""
-    try:
-        return [r["egl_id"] for r in map_devices() if r["gpu_name"] and "A100" in r["gpu_name"]]
-    except Exception:  # noqa: BLE001
+_PROBE = ("import mujoco\nfrom vla.sim.egl import gl_renderer\n"
+          "m=mujoco.MjModel.from_xml_string('<mujoco/>'); r=mujoco.Renderer(m,16,16); r.update_scene(mujoco.MjData(m)); "
+          "r.render(); print('RENDERER=' + gl_renderer())")
+
+
+def probe_mujoco_ids(max_id: int = 16) -> dict[int, str | None]:
+    """{MUJOCO_EGL_DEVICE_ID: GL_RENDERER or None if it cannot initialise}, one subprocess per id (ground truth).
+    MuJoCo indexes its own device list, which does NOT line up with the raw eglQueryDevicesEXT / PCI table above."""
+    out: dict[int, str | None] = {}
+    for dev in range(max_id):
+        r = subprocess.run([sys.executable, "-c", _PROBE], capture_output=True, text=True,
+                           env={**os.environ, "MUJOCO_GL": "egl", "MUJOCO_EGL_DEVICE_ID": str(dev)})
+        line = [x for x in r.stdout.splitlines() if x.startswith("RENDERER=")]
+        out[dev] = line[0][9:] if r.returncode == 0 and line else None
+    return out
+
+
+def recommended_ids(probe: dict | None = None, name: str = "A100") -> list[int]:
+    """MuJoCo EGL ids whose probed GL_RENDERER contains `name` (probe-based; the PCI table is informational only)."""
+    if not sys.platform.startswith("linux"):
         return []
+    probe = probe_mujoco_ids() if probe is None else probe
+    return [d for d, r in probe.items() if r and name in r]
 
 
 def gl_renderer() -> str:
@@ -95,17 +112,17 @@ def assert_nvidia_renderer(env) -> str:
 def main() -> int:
     try:
         rows = map_devices()
+        print("raw EGL list (informational; NOT MuJoCo ids):")
+        for r in rows:
+            print(f"  raw {r['egl_id']}: drm={r['drm']} pci={r['pci']} -> {r['gpu_name'] or 'unknown'}")
     except Exception as e:  # noqa: BLE001
-        print(f"EGL->GPU mapping: cannot determine ({type(e).__name__}: {e})")
-        return 0
-    for r in rows:
-        desc = f"nvidia-smi index {r['gpu_index']} ({r['gpu_name']})" if r["gpu_name"] else "unknown"
-        print(f"  EGL device {r['egl_id']}: drm={r['drm']} pci={r['pci']} -> {desc}")
-    good = [r["egl_id"] for r in rows if r["gpu_name"] and "A100" in r["gpu_name"]]
-    if good:
-        print(f"recommended VLA_EGL_DEVICES={','.join(map(str, good))}  (A100 EGL ids; set in .env)")
-    else:
-        print("EGL->GPU mapping: could not map any EGL device to an A100; no recommendation")
+        print(f"raw EGL->GPU table unavailable ({type(e).__name__}: {str(e)[:80]})")
+    probe = probe_mujoco_ids()
+    print("MuJoCo EGL ids (probe):")
+    for d, r in probe.items():
+        print(f"  MUJOCO_EGL_DEVICE_ID={d}: {r or 'cannot initialise'}")
+    rec = recommended_ids(probe)
+    print(f"recommended VLA_EGL_DEVICES={','.join(map(str, rec))}" if rec else "no A100 renderer found")
     return 0
 
 
