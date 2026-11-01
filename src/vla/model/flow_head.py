@@ -60,6 +60,8 @@ class FlowDiT(nn.Module):
 
     def forward(self, x_t, t, proprio, ctx, ctx_mask):
         """x_t [B,H,act_dim], t [B], proprio [B,P], ctx [B,S,ctx_dim], ctx_mask [B,S] (1=valid) -> velocity [B,H,act_dim]."""
+        dt = self.act_in.weight.dtype  # compute dtype (bf16 under FSDP2 mixed precision): t / noise are created in fp32
+        x_t, proprio, ctx = x_t.to(dt), proprio.to(dt), ctx.to(dt)
         x = torch.cat([self.act_in(x_t), self.proprio_in(proprio)[:, None]], dim=1) + self.pos
         c = self.t_mlp(timestep_embedding(t, self.d).to(x.dtype))
         ctx = self.ctx_proj(ctx)
@@ -81,7 +83,7 @@ def flow_loss(dit: FlowDiT, actions, proprio, ctx, ctx_mask, t=None, noise=None)
     eps = torch.randn_like(actions) if noise is None else noise
     x_t = t[:, None, None] * eps + (1 - t[:, None, None]) * actions
     v = dit(x_t, t, proprio, ctx, ctx_mask)
-    return F.mse_loss(v, eps - actions)
+    return F.mse_loss(v.float(), (eps - actions).float())  # loss in fp32
 
 
 @torch.no_grad()
