@@ -18,7 +18,8 @@ dependencies = [
 
 [project.optional-dependencies]
 # Remote server only. Local `uv sync` does not install extras.
-gpu = ["deepspeed", "flash-attn"]
+# flash-attn is NOT listed: no source build under nvcc 13.2; setup.sh installs a prebuilt wheel if one matches.
+gpu = ["deepspeed"]
 dev = ["pytest"]
 
 [build-system]
@@ -28,6 +29,10 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/vla"]
 
-[tool.uv]
-# flash-attn needs torch at build time
-no-build-isolation-package = ["flash-attn"]
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true

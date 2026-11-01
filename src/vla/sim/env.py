@@ -24,6 +24,15 @@ WS_HI = np.array([0.80, 0.40, 0.55])
 PUSH_DIST = 0.14
 
 
+def set_egl_device(worker_id: int, device_ids: list[int] | None = None) -> None:
+    """Round-robin MUJOCO_EGL_DEVICE_ID over the A100 EGL ids (env VLA_EGL_DEVICES=1,2,..). Call before creating envs."""
+    import os
+
+    if device_ids is None:
+        device_ids = [int(x) for x in os.environ.get("VLA_EGL_DEVICES", "0").split(",")]
+    os.environ["MUJOCO_EGL_DEVICE_ID"] = str(device_ids[worker_id % len(device_ids)])
+
+
 class TabletopEnv(gym.Env):
     metadata = {"render_modes": ["rgb_array"], "render_fps": 10}
 
