@@ -85,7 +85,8 @@ def collect_batch(vec: SubprocVecEnv, engine: InferenceEngine, cfg, seeds: list[
 
 def rollout_loop(cfg, roles, rank: int, device, model, sync_pg, p_mean, p_std, shm: Path, log=print):
     vec = SubprocVecEnv(cfg.n_envs)
-    engine = InferenceEngine(model, cfg.temperature)
+    n_img = (model.cfg.image_size // 16) ** 2
+    engine = InferenceEngine(model, cfg.temperature, cfg.engine_mode, max_prefix=n_img + 1 + cfg.max_prompt_tokens)
     gen = torch.Generator(device=device).manual_seed(cfg.seed * 7919 + rank)
     S, K = cfg.staleness, cfg.iterations
     ridx = roles.rollout_ranks.index(rank)

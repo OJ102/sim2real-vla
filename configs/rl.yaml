@@ -10,3 +10,4 @@ seeds_per_iter: 8
 group_size: 8
 lr: 2.0e-6
 # init_ckpt: $VLA_RUNS/bc_disc/final.pt ; data_dir: $VLA_DATA/demos (set via overrides)
+engine_mode: graph   # CUDA-graph decode on GPU (falls back to static cache if capture fails; see engine.graph_status)

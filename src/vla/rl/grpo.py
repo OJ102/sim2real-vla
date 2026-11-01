@@ -45,6 +45,8 @@ class RLConfig:
     seeds_per_iter: int = 8             # per rollout rank
     group_size: int = 8                 # G
     temperature: float = 1.0
+    engine_mode: str = "eager"          # rollout engine: eager | static | graph (CUDA graphs; set graph on GPU)
+    max_prompt_tokens: int = 32         # static-cache sizing: fixed prefix budget so one CUDA graph serves all batches
     lr: float = 2.0e-6
     epochs: int = 2
     minibatch: int = 64
