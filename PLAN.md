@@ -248,3 +248,14 @@ Acceptance:
 - src/vla/train/bc.py (+ checkpoint.py)
 - src/vla/rl/grpo.py
 - src/vla/infer/policy.py
+
+---
+
+# PLAN v2 delta (Opus planner, 2026-11-01). Status: APPROVED 2026-11-01
+
+The full v2 text is in docs/PLAN_v2.md and supersedes v1 wherever they differ. Summary of its decisions:
+- Accepted: A (decoupled actor-learner RL, replaces RL-on-DDP), lm_head slicing to the 256 action rows plus a roofline analysis, C (MFU/scaling/profiling), D (seeds and ablations, trimmed), B1 (flow-matching DiT action head, BC head-to-head), E (async DCP checkpointing), F1/F3 (DTD photo-texture heldout split, true heldout light direction and kp).
+- B2 (Flow-GRPO) is a gated stretch.
+- Deferred: F2 (2-frame history). Rejected: Triton kernel.
+- Cuts: no flash-attn build (use SDPA flash backend, labeled), no DeepSpeed training run (ZeRO-3 only in the scaling sweep), reach excluded from RL and ablations.
+- Budget: about 55 GPU-h plus a 5 GPU-h reserve, 60 GPU-h or less in total.
