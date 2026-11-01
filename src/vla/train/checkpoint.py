@@ -107,13 +107,13 @@ class Checkpointer:
         return state["extra"]
 
 
-def export_final(model, path: str | os.PathLike, dtype=torch.bfloat16) -> None:
+def export_final(model, path: str | os.PathLike, dtype=torch.bfloat16, group=None) -> None:
     """Model weights only (no optimizer): full state dict gathered to rank 0 and saved as one .pt file."""
     sd, _ = get_state_dict(model, [], options=StateDictOptions(full_state_dict=True, cpu_offload=True))
-    if not dist.is_initialized() or dist.get_rank() == 0:
+    if not dist.is_initialized() or dist.get_rank(group) == 0:
         torch.save({k: (v.to(dtype) if v.is_floating_point() else v) for k, v in sd.items()}, path)
     if dist.is_initialized():
-        dist.barrier()
+        dist.barrier(group=group)  # group = the ranks that hold the model (e.g. learner ranks only in RL)
 
 
 class PreemptFlag:

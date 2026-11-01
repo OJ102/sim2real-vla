@@ -1,0 +1,15 @@
+name: rl_tiny
+model_config: configs/model_tiny.yaml
+head: discrete
+n_learner: 1
+n_rollout: 1
+staleness: 0
+iterations: 2
+tasks: [lift]
+seeds_per_iter: 2
+group_size: 2
+minibatch: 4
+micro_batch: 2
+sync_dtype: float32
+ckpt_every: 0
+mem_cap_gb: 0

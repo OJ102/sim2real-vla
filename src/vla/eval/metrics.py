@@ -6,10 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-DT = 0.1  # control period (s)
-JOINT_LO = np.array([-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973])
-JOINT_HI = np.array([2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973])
-QD_MAX = np.array([2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61])  # Panda joint velocity limits (rad/s)
+from vla.sim.rewards import DT, JOINT_HI, JOINT_LO, QD_MAX  # noqa: E402,F401
 
 
 def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:

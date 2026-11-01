@@ -33,7 +33,7 @@ def layer_modules(model: nn.Module) -> list[nn.Module]:
 
 
 def wrap_fsdp2(model: nn.Module, bf16: bool = True, reshard_after_forward: bool = True, prefetch: bool = False,
-               act_ckpt: bool = False) -> nn.Module:
+               act_ckpt: bool = False, mesh=None) -> nn.Module:
     """fully_shard each block, then the root. bf16 params / fp32 gradient reduction (cast_forward_inputs=False so
     the action targets are not rounded to bf16 before tokenisation)."""
     from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
@@ -46,7 +46,8 @@ def wrap_fsdp2(model: nn.Module, bf16: bool = True, reshard_after_forward: bool 
     from torch.distributed.device_mesh import init_device_mesh
 
     # explicit mesh: the default picks "mps" on macOS and crashes (torch.mps has no is_initialized)
-    mesh = init_device_mesh("cuda" if torch.cuda.is_available() else "cpu", (dist.get_world_size(),))
+    if mesh is None:
+        mesh = init_device_mesh("cuda" if torch.cuda.is_available() else "cpu", (dist.get_world_size(),))
     kw = {"mesh": mesh, **({"mp_policy": mp} if mp is not None else {})}
     layers = layer_modules(model)
     for m in layers:

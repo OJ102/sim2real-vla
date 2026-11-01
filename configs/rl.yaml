@@ -1,0 +1,12 @@
+name: rl_disc
+model_config: configs/model_0p5b.yaml
+head: discrete
+n_learner: 1
+n_rollout: 1
+staleness: 1
+iterations: 100
+tasks: [lift, push]
+seeds_per_iter: 8
+group_size: 8
+lr: 2.0e-6
+# init_ckpt: $VLA_RUNS/bc_disc/final.pt ; data_dir: $VLA_DATA/demos (set via overrides)

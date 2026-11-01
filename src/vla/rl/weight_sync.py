@@ -44,8 +44,13 @@ def sync_weights(model: nn.Module, pg, src: int, version: int = 0, bucket_bytes:
                  sync_dtype: torch.dtype | None = None) -> dict:
     """Broadcast `model`'s params from global rank `src`. Every rank of `pg` calls this with a model of identical
     structure. Returns {version, latency_ms, nbytes, n_buckets}; on receivers `version` is the sender's version."""
-    is_sender = dist.get_rank() == src
     items = _items(model, sync_dtype)
+    if pg is None:  # non-source learner rank: only participate in the FSDP2 full_tensor() collectives
+        for bucket in plan_buckets(items, bucket_bytes):
+            for i in bucket:
+                _full(items[i][1])
+        return {"version": version, "latency_ms": 0.0, "nbytes": 0, "n_buckets": 0}
+    is_sender = dist.get_rank() == src
     plan = plan_buckets(items, bucket_bytes)
     dev = items[0][1].device if not hasattr(items[0][1], "device_mesh") else items[0][1].to_local().device
     t0 = time.perf_counter()

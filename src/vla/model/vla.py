@@ -149,6 +149,8 @@ class VLA(nn.Module):
     # ------------------------------------------------------------------ training
     def forward(self, batch: dict) -> dict:
         """batch: image, proprio [B,P] (normalised), input_ids, attention_mask, actions [B,H,act_dim] in [-1,1]."""
+        if "bins" in batch:  # RL path: per-token log-probs; goes through forward() so FSDP2 root hooks fire
+            return {"logp": self.token_logprobs(batch, batch["bins"])}
         prefix, mask = self.embed_prefix(batch)
         P = prefix.shape[1]
         if self.cfg.head == "flow":
