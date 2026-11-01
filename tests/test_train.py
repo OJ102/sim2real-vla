@@ -172,12 +172,11 @@ def test_async_latest_only_after_future_completes(tmp_path, monkeypatch):
     assert ck.latest() == "step_000010"
     pending[str(tmp_path / "step_000020")][0].set_result(None)
     ck.wait(); assert ck.latest() == "step_000020"
-    # failed save must not publish
+    # failed save must not publish and must not raise
     ck.save(30, m, opt, {"step": 30})
     pending[str(tmp_path / "step_000030")][0].set_exception(RuntimeError("disk full"))
-    with pytest.raises(RuntimeError):
-        ck.wait()
-    assert ck.latest() == "step_000020"
+    ck.wait()                                   # failed saves are tolerated now (logged, training continues)
+    assert ck.latest() == "step_000020" and ck.n_failed == 1
 
 
 def test_sync_checkpoint_roundtrip_no_dist(tmp_path):
