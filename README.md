@@ -5,8 +5,9 @@ closed loop, and post-trains it with reinforcement learning. The point of the pr
 policy: distributed training, checkpointing, a decoupled actor-learner RL loop, and an inference path that is
 analysed against the hardware limits. The policy itself is small and the tasks are simple.
 
-All numbers in this README are placeholders (`TBD`) until the corresponding result file exists in `results/`.
-`scripts/make_tables.py` renders those files into `results/tables.md`; copy the tables from there.
+Numbers in this README come from measured runs; anything not yet measured is marked `TBD`. The final tables are
+rendered by `scripts/make_tables.py` from the JSON files in `results/` into `results/tables.md`. The behaviour-cloning
+numbers below were transcribed from the evaluation logs; their JSON files are being regenerated (see Status).
 Nothing here claims a multi-node run: launches are multi-node-ready (`torchrun` with a c10d rendezvous), but every
 reported result is single-node on four A100s that were shared with other users.
 
@@ -16,10 +17,10 @@ reported result is single-node on four A100s that were shared with other users.
 |---|---|---|
 | Simulator | MuJoCo tabletop, Franka Panda, three coloured cubes, tasks `reach`, `lift`, `push`; 4-D end-effector delta actions at 10 Hz, damped-least-squares IK | `src/vla/sim/` |
 | Domain randomization | Camera, lighting, textures, friction, mass, actuator gains; three splits (`train`, `heldout`, `heldout_photo`) | `sim/randomization.py` |
-| Expert and data | Scripted waypoint expert, parallel headless generation to HDF5 shards, resumable sampler | `sim/expert.py`, `src/vla/data/` |
-| Model | SigLIP-base + 2-layer MLP projector + Qwen2.5-0.5B (0.58B parameters); discrete-token or flow-matching action head | `src/vla/model/` |
+| Expert and data | Scripted waypoint expert, parallel headless generation to HDF5 shards (with per-frame cube positions and the target index), resumable sampler with early-frame oversampling | `sim/expert.py`, `src/vla/data/` |
+| Model | SigLIP-base + 2-layer MLP projector + Qwen2.5-0.5B (0.58B parameters); discrete-token or flow-matching action head; optional auxiliary target-position head | `src/vla/model/` |
 | BC training | FSDP2 (also DDP and a DeepSpeed ZeRO-3 path used only in the scaling sweep), bf16, sync or async DCP checkpoints | `src/vla/train/` |
-| Evaluation | Batched closed-loop rollouts, Wilson intervals, success relative to the expert ceiling, smoothness and safety metrics | `src/vla/eval/` |
+| Evaluation | Batched closed-loop rollouts, Wilson intervals, success relative to the expert ceiling, smoothness and safety metrics; a first-frame grounding probe | `src/vla/eval/`, `scripts/probe_grounding.py` |
 | RL | Decoupled actor-learner GRPO with truncated importance sampling; Flow-GRPO for the flow head | `src/vla/rl/` |
 | Inference | Eager, static-KV-cache and CUDA-graph decode; latency benchmark with a roofline analysis | `src/vla/infer/` |
 | Remote tooling | Setup, rsync, detached launch with exit-code capture, GPU snapshots, quiet-window waiting | `scripts/` |
@@ -34,8 +35,9 @@ flowchart LR
     OBS --> VIT[SigLIP-base] --> PROJ[MLP projector]
     PROP[proprio MLP] --> SEQ
     TXT["prompt 'In: {instruction}\nOut:'"] --> SEQ
-    PROJ --> SEQ["sequence: 196 image tokens | 1 proprio | prompt"]
+    PROJ --> SEQ["sequence: prompt (left-padded) | 196 image tokens | 1 proprio"]
     SEQ --> LLM[Qwen2.5-0.5B]
+    LLM -->|"aux, training only"| GH["ground head: target cube xy"]
     LLM -->|discrete head| TOK["16 action tokens, 256 bins\n(sliced 256-row head)"]
     LLM -->|flow head| DIT["DiT, adaLN on t, cross-attention\n10 Euler steps (ODE) / K SDE steps (RL)"]
     TOK --> ACT["action chunk: 4 steps x (dx, dy, dz, gripper)"]
@@ -59,6 +61,10 @@ Design notes, in the order a reader is likely to ask:
   4 steps is 16 tokens. The loss is cross-entropy over the 256 action rows only, which equals a logit mask to the
   action vocabulary without materialising a full-vocabulary logits tensor. At inference the head is sliced to those
   256 rows (0.23M parameters instead of about 136M).
+* **Prefix order: text first.** The prompt comes before the image tokens, so under causal attention the image tokens
+  are encoded already knowing which cube was asked for. The original order (image, proprio, prompt) is still the
+  default in `VLAConfig.prefix_order` and in `configs/model_0p5b.yaml`; `configs/model_0p5b_txt.yaml` selects
+  `txt_first`. Why this matters is the subject of the next section.
 * **Flow head.** A 6-layer DiT (d=512, about 36M parameters) cross-attends to the backbone's hidden states over the
   prompt/image prefix; rectified flow with a Beta(1.5, 1) timestep density; 10 Euler steps at evaluation.
 * **Splits.** `train` randomizes within the ranges in `DRConfig`. `heldout` uses disjoint light directions, a wider kp
@@ -74,6 +80,56 @@ Design notes, in the order a reader is likely to ask:
 * **Flow-GRPO.** For the flow head the probability-flow ODE is replaced by the marginal-preserving SDE of the
   Flow-GRPO paper (`sigma_t = a * sqrt(t / (1 - t))`, Euler-Maruyama), so each denoising step is Gaussian with a
   closed-form log-probability and KL. This stage is gated on the BC results (see `docs/PLAN_v2.md`) and may not be reported.
+
+## Colour grounding: diagnosis and fix
+
+The first behaviour-cloning models were weak on `reach` and `lift` (15% and 12.5% train success against an expert at
+100%), but scored about 50% on `push`. All three tasks name a cube by colour; `push` always starts with the same motion.
+
+**Diagnosis.** A first-frame probe compares the policy's predicted xy motion with the expert's heading towards the
+named cube, then swaps the colour word in the instruction and checks again.
+* On training episodes the first-frame cosine was 0.39 (reach) and 0.48 (lift).
+* Swapping the colour word changed the actions by 0.003 to 0.03 and never changed which cube the arm went to.
+* The policy had learned "go to some cube" and ignored the colour word.
+
+Three controls ruled out the data:
+* A small CNN given the pixels and a one-hot colour located the named cube to 1.3 cm under full randomization
+  (0.3 cm without camera randomization).
+* The same VLA, trained only to predict that position, stayed at chance (13 cm) with both datasets.
+* So the labels, images and camera randomization were fine; the VLA pathway was not using the word.
+
+**What did not work.**
+* An auxiliary loss that predicts the target cube's xy from the last prefix position: its output moved 0.004 across
+  colour words and 0.60 across images.
+* Adding counterfactual colour queries (swap the word, relabel with the other cube's xy, drop that row from the
+  action loss): still at chance.
+
+**What worked: putting the text before the image.**
+* With the image first, the image tokens are encoded without the question and a single read-out position has to
+  recover the target from them.
+* With the text first, every image token attends to the colour word.
+* In the position-only diagnostic this broke the plateau at about step 700 (2.3 cm). The image-first model at 5x the
+  learning rate stayed stuck.
+
+The final recipe (`configs/bc_ground_disc.yaml`) combines:
+* the text-first prefix
+* the auxiliary position loss (weight 0.2)
+* counterfactual colour queries (p = 0.25)
+* 3x oversampling of the first four frames of each episode
+
+The first-frame probe on validation episodes:
+
+| Discrete head | reach cos to expert | lift cos to expert | after colour swap: cos to the new cube / old cube | target position error |
+|---|---|---|---|---|
+| Before (image first, no aux loss) | 0.48 | TBD (JSON being regenerated) | unchanged by the swap | not measured |
+| After (`bc_gdisc3`, step 1,000) | 0.96 | 0.97 | 0.95 / 0.04 (reach), 0.97 / 0.06 (lift) | 1.3 cm |
+
+The probe gate requires a cosine of at least 0.9 on reach and lift and a colour swap that redirects the arm.
+
+**Flow head.** Training the flow head from scratch with the same recipe did not escape the plateau by step 500,
+even with the auxiliary weight raised to 0.2. Its gradient norm in the first 200 steps was 30 to 55 (clipped to 1.0),
+against 5 to 20 for the discrete head. A warm start from the grounded discrete backbone (`init_from`) is being
+evaluated. See Status.
 
 ## Setup
 
@@ -120,9 +176,21 @@ Every command below is run from the repository root with `.env` sourced.
 3. **Behaviour cloning** (discrete and flow heads, same backbone initialisation, data and seed)
 
    ```bash
+   # baseline (image-first, no grounding loss)
    torchrun --nproc_per_node=4 -m vla.train.bc --config configs/bc.yaml name=bc_disc
    torchrun --nproc_per_node=4 -m vla.train.bc --config configs/bc.yaml name=bc_flow head=flow
+   # grounded recipe (text-first prefix, aux position loss, colour swaps, early-frame oversampling)
+   torchrun --nproc_per_node=4 -m vla.train.bc --config configs/bc_ground_disc.yaml
+   # flow head warm-started from the grounded discrete model
+   torchrun --nproc_per_node=4 -m vla.train.bc --config configs/bc_ground_flow.yaml ground_weight=0.2 \
+       init_from=$VLA_CKPT/bc_gdisc3/best.pt
+   # first-frame grounding probe (pass/fail gate)
+   uv run python scripts/probe_grounding.py --ckpt $VLA_RUNS/bc_gdisc3/best.pt --head discrete \
+       --data $VLA_DATA/demos --model-config configs/model_0p5b_txt.yaml --n-train 300 --out results/probe_bc_gdisc3_best.json
    ```
+
+   `stop_at=<step>` saves and exits early so a run can be gated and then resumed on the same schedule.
+   `keep_best=true` keeps the checkpoint with the lowest validation action loss as `best.pt`.
 
    Checkpoints go to `$VLA_CKPT/<name>/ckpt` (latest two kept, DCP shards, optimizer state included);
    `$VLA_RUNS/<name>/final.pt` is weights-only bf16. A run killed at any point resumes with `--resume`.
@@ -132,8 +200,13 @@ Every command below is run from the repository root with `.env` sourced.
    ```bash
    uv run python -m vla.eval.rollout_eval --policy vla --ckpt $VLA_RUNS/bc_disc/final.pt \
        --model-config configs/model_0p5b.yaml --head discrete --data-dir $VLA_DATA/demos \
-       --splits train,heldout,heldout_photo --tasks lift,push --episodes 200 --n-envs 32 --bf16 --quiet-wait \
+       --splits train,heldout,heldout_photo --tasks reach,lift,push --episodes 200 --n-envs 32 --bf16 --quiet-wait \
        --out results/eval_bc_disc.json
+   # grounded model: pass the text-first model config and keep the ground head so the checkpoint loads strictly
+   uv run python -m vla.eval.rollout_eval --policy vla --ckpt $VLA_RUNS/bc_gdisc3/best.pt \
+       --model-config configs/model_0p5b_txt.yaml --override ground_weight=0.2 --head discrete \
+       --data-dir $VLA_DATA/demos --splits train,heldout,heldout_photo --tasks reach,lift,push \
+       --episodes 200 --n-envs 32 --bf16 --out results/eval_bc_gdisc3.json
    uv run python -m vla.eval.rollout_eval --policy expert --out results/eval_expert.json
    ```
 
@@ -170,16 +243,38 @@ Every command below is run from the repository root with `.env` sourced.
 
 ## Results
 
-Placeholders only. Each cell is replaced from `results/tables.md` when the underlying file exists.
+Measured cells are filled in; `TBD` cells are not measured yet.
 
 ### Policy results (closed loop, 200 episodes per task and split, fixed seeds)
 
-| Policy | Task | Train success % [95% CI] | Held-out | Held-out photo | EE jerk RMS | Violations per episode |
-|---|---|---|---|---|---|---|
-| Scripted expert | lift / push | TBD | TBD | TBD | TBD | TBD |
-| BC, discrete head | lift / push | TBD | TBD | TBD | TBD | TBD |
-| BC, flow head | lift / push | TBD | TBD | TBD | TBD | TBD |
-| BC + RL (mean ± std over TBD seeds) | lift / push | TBD | TBD | TBD | TBD | TBD |
+Success rate with 95% Wilson interval. The GPUs were shared during the BC evaluations; that affects timing only, not success.
+
+| Policy | Task | Train | Held-out | Held-out photo |
+|---|---|---|---|---|
+| Scripted expert (ceiling) | reach | 1.00 | 1.00 | 1.00 |
+| | lift | 1.00 | 0.92 | 0.92 |
+| | push | 0.985 | 0.725 | 0.725 |
+| BC, discrete head (baseline) | reach | 0.150 [0.11, 0.21] | 0.125 [0.09, 0.18] | 0.135 [0.09, 0.19] |
+| | lift | 0.125 [0.09, 0.18] | 0.085 [0.05, 0.13] | 0.085 [0.05, 0.13] |
+| | push | 0.490 [0.42, 0.56] | 0.260 [0.20, 0.32] | 0.285 [0.23, 0.35] |
+| BC, flow head (baseline) | reach | 0.180 [0.13, 0.24] | 0.100 [0.07, 0.15] | 0.105 [0.07, 0.16] |
+| | lift | 0.130 [0.09, 0.18] | 0.090 [0.06, 0.14] | 0.065 [0.04, 0.11] |
+| | push | 0.545 [0.48, 0.61] | 0.255 [0.20, 0.32] | 0.215 [0.16, 0.28] |
+| **BC, discrete head, grounded** (`bc_gdisc3`) | reach | **0.855** [0.80, 0.90] | **0.450** [0.38, 0.52] | **0.410** [0.34, 0.48] |
+| | lift | **0.610** [0.54, 0.67] | **0.290** [0.23, 0.36] | **0.285** [0.23, 0.35] |
+| | push | 0.460 [0.39, 0.53] | 0.205 [0.15, 0.27] | 0.245 [0.19, 0.31] |
+| BC, flow head, grounded | all | TBD | TBD | TBD |
+| BC + RL (mean ± std over TBD seeds) | all | TBD | TBD | TBD |
+
+What the table shows:
+* Grounding lifts reach and lift success 3 to 6x on every split.
+* Push is unchanged within the intervals: it never depended on the colour word.
+* The gap between train and the held-out splits (0.855 to 0.45 on reach) is the target for RL post-training.
+
+End-effector jerk (RMS, lower is smoother):
+* Grounded discrete model: 6.5 to 11.6 on train and 13.0 to 15.7 on the held-out splits.
+* Discrete baseline: 6.2 to 17.9, with most of its successes on push.
+* Safety-violation counts and success relative to the ceiling are added when the result JSONs are regenerated.
 
 Randomization ablations (short schedule, one seed, labelled as such) and the data-scaling points: TBD.
 
@@ -231,6 +326,29 @@ The four A100s used here were shared with other users' jobs, some at 60-99% util
   The `contended` flag is derived from utilisation and can under-report when foreign processes are not visible
   (for example inside a container).
 
+## Status
+
+Done:
+* Simulator, randomization splits and data pipeline.
+* Distributed BC with resumable checkpoints.
+* Evaluation and the grounding probe.
+* Grounded discrete BC model.
+* The RL, inference and benchmark code paths exist and are covered by CPU tests (295 passing). Their GPU results are not
+  measured yet.
+
+In progress:
+* Flow head, warm-started from the grounded discrete backbone: 500-step probe gate running.
+* The behaviour-cloning result JSONs (`eval_bc_*.json`, `probe_bc_*.json`) were deleted on the server by an rsync
+  `--delete` before they were copied off. The success numbers above come from the evaluation logs. The JSONs will be
+  regenerated (about 15 minutes per model on one GPU), and `sync.sh` now protects `results/`.
+
+Next:
+* Checkpoint-stall study, memory table and scaling sweep.
+* Randomization ablations on the grounded recipe.
+* RL post-training (3 seeds plus a penalty ablation).
+* Latency benchmark.
+* Demo videos.
+
 ## Limitations
 
 * The tasks are short, scripted-expert-solvable manipulation tasks in simulation. The held-out splits probe robustness
@@ -243,6 +361,10 @@ The four A100s used here were shared with other users' jobs, some at 60-99% util
   episodes within a seed, not across seeds.
 * The CUDA-graph decode path depends on the installed `transformers` version; the engine falls back to the static-cache
   eager path and reports the reason if graph capture fails.
+* The grounding fix was found and tuned on the `train` split's validation episodes. The held-out splits were only
+  evaluated after the recipe was fixed, so they were not used to choose it.
+* The grounding recipe adds an auxiliary label (the target cube's position) that a real-robot dataset would need to
+  provide, for example from a detector or from the end position of the demonstration.
 * Flow-GRPO uses a coarse K-step grid whose first step starts at `t = 1 - 1/(2K)`; this is an approximation of the
   paper's setup and is noted where its results are reported.
 

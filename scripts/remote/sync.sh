@@ -5,5 +5,6 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 HOST=${1:-ucgpu}; DIR=${2:-vla}
 # Explicit P (protect) rules: a dir-merge ':- .gitignore' does NOT protect receiver-side files from --delete.
-rsync -az --delete --exclude .git --exclude .env --filter='P .env' --filter='P .env.gl' \
+# results/ is protected too: server-written JSONs are gitignored-or-absent locally and --delete would wipe them.
+rsync -az --delete --exclude .git --exclude .env --filter='P .env' --filter='P .env.gl' --filter='P results/***' \
   --filter=':- .gitignore' ./ "$HOST:$DIR/"
