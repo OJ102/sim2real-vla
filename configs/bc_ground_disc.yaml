@@ -1,5 +1,5 @@
-name: bc_gdisc2
-model_config: configs/model_0p5b.yaml
+name: bc_gdisc3
+model_config: configs/model_0p5b_txt.yaml
 head: discrete
 backend: fsdp
 global_batch: 256

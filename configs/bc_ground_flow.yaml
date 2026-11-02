@@ -1,5 +1,5 @@
-name: bc_gflow2
-model_config: configs/model_0p5b.yaml
+name: bc_gflow3
+model_config: configs/model_0p5b_txt.yaml
 head: flow
 backend: fsdp
 global_batch: 256

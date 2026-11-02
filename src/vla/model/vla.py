@@ -43,6 +43,7 @@ class VLAConfig:
     act_dim: int = 4
     proprio_dim: int = 11
     n_bins: int = 256
+    prefix_order: str = "img_first"         # img_first: [img, proprio, txt] (default) | txt_first: [txt, img, proprio]
     ground_weight: float = 0.0              # >0: aux target-xy grounding head at the last prefix token (BC training only)
     image_size: int = 224                   # images are resized to this before the vision tower
     flow: FlowConfig = field(default_factory=FlowConfig)
@@ -80,6 +81,8 @@ class VLA(nn.Module):
                                   SiglipVisionModel)
 
         self.cfg = cfg
+        if cfg.prefix_order not in ("img_first", "txt_first"):
+            raise ValueError(f"prefix_order must be img_first|txt_first, got {cfg.prefix_order}")
         impl = cfg.attn_impl
         if cfg.tiny:
             vcfg = SiglipVisionConfig(hidden_size=64, intermediate_size=128, num_hidden_layers=2, num_attention_heads=4,
@@ -142,9 +145,12 @@ class VLA(nn.Module):
         pro = self.proprio_mlp(batch["proprio"].to(dtype))[:, None]
         txt = emb(batch["input_ids"])
         b = img.shape[0]
-        mask = torch.cat([torch.ones(b, img.shape[1] + 1, dtype=torch.long, device=img.device),
-                          batch["attention_mask"]], dim=1)
-        return torch.cat([img, pro, txt], dim=1), mask
+        ones = torch.ones(b, img.shape[1] + 1, dtype=torch.long, device=img.device)  # image tokens + proprio token
+        if self.cfg.prefix_order == "txt_first":
+            # [txt (left-padded), img, proprio]: with causal attention every image token can condition on the
+            # instruction (the colour word). Position P-1 is the proprio token, still the action/ground read-out.
+            return torch.cat([txt, img, pro], dim=1), torch.cat([batch["attention_mask"], ones], dim=1)
+        return torch.cat([img, pro, txt], dim=1), torch.cat([ones, batch["attention_mask"]], dim=1)
 
     @staticmethod
     def _pos(mask: torch.Tensor) -> torch.Tensor:

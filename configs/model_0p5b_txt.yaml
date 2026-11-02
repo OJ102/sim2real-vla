@@ -1,0 +1,5 @@
+vision_name: google/siglip-base-patch16-224
+llm_name: Qwen/Qwen2.5-0.5B
+head: discrete
+attn_impl: sdpa
+prefix_order: txt_first   # [txt, img, proprio] (Amendment B)
