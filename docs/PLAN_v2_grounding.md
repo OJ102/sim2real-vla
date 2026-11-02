@@ -65,3 +65,18 @@ Gate at step 500 FAILED for both heads (val t=0: disc reach .41 / lift .40, flow
 - New run names `bc_gdisc2` / `bc_gflow2` (fresh runs, same schedule, stop_at=500 gate, same gate criteria on the t=0 probe).
 - Tests: p=0 reproduces current batches exactly; same (seed, epoch, i) → same swap; swapped row has a different colour word and ground_xy == that cube's normalised xy; push "yellow zone" untouched; all-swapped batch → main_loss 0 without NaN, ground loss finite; main loss ignores swapped rows (perturbing their actions changes nothing).
 - Budget: +1.3 GPU-h (re-gate both heads).
+
+## Amendment B (2026-11-01, user-approved incl. ~+1.2 GPU-h over the fix budget): text-first prefix
+Gate with Amendment A FAILED (bc_gdisc2/bc_gflow2 step 500: swap_delta 0.0, val_ground_err_cm_swap 17–18 cm). Diagnostics (1 GPU, t=0 frames, ground loss only, 50% colour swap, bs32, 1000 steps):
+| variant | val err orig | val err swapped |
+|---|---|---|
+| [img, proprio, txt] lr 1e-4 | 13.6 cm (chance) | 13.0 |
+| [img, proprio, txt] lr 5e-4 | 13.6 cm | 13.0 |
+| **[txt, img, proprio] lr 1e-4** | **2.3 cm** | **2.5** |
+Control: 4-layer CNN on pixels + colour one-hot reaches 1.3 cm (full DR) / 0.3 cm (fixed camera) in ~15 s, so data/labels are fine. With image tokens first (causal attention) they can never condition on the colour word; text-first lets every image position do colour-conditioned selection. The text-first run broke a mean-prediction plateau at ~step 700 (≈22k samples).
+- `VLAConfig.prefix_order: str = "img_first"` (default = current behaviour, bit-identical) | `"txt_first"` → prefix `[txt (left-padded), img, proprio]`, mask permuted identically; position ids from `_pos(mask)` as now. Prefix position P-1 (now the proprio token) remains the action/ground read-out position.
+- Every path that builds or assumes the prefix layout must honour it: `embed_prefix`, discrete teacher forcing, `predict`, flow path, `token_logprobs`, `flow_rl_logp`, the static/graph inference engines (`src/vla/infer/engine.py`, any max_prefix / offset assumptions), RL rollout. 
+- New model config `configs/model_0p5b_txt.yaml` (= model_0p5b + `prefix_order: txt_first`); ground configs point at it, run names `bc_gdisc3` / `bc_gflow3`. Eval/probe select it via `--model-config` (order is not detectable from weights).
+- Gate unchanged (step 500, t=0 probe, val, reach+lift). Pass → resume to 1200, probe best.pt, 200-ep eval × 3 splits.
+- Tests: default order bit-identical to current (logits ref test still passes); txt_first prefix = [txt, img, pro] with matching mask/positions; left padding stays at the sequence start; predict / token_logprobs / static+graph engine (CPU static path) agree with teacher-forced logits under txt_first; ground head reads P-1; old checkpoints load under either order.
+- Budget: re-gate 1.3 + full runs 1.9 GPU-h (fix total ≈ 6.3 vs 5.1 approved; user approved the overrun).
