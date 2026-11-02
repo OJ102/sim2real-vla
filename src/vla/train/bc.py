@@ -77,6 +77,7 @@ class BCConfig:
     early_k: int = 4                    # frames with t < early_k ...
     early_w: int = 1                    # ... are repeated early_w times per epoch (1 = off; grounding configs use 3)
     ground_swap_p: float = 0.0          # Amendment A: prob. of a counterfactual colour-swapped sample (0 = off)
+    init_from: str | None = None        # warm start: full-state .pt, strict=False, shape-filtered (ignored when --resume restores)
     stop_at: int = 0                    # >0: save DCP ckpt + export stop_<step>.pt at this step and exit 0 (gate runs)
     keep_best: bool = True              # export best.pt whenever val main_loss improves
     exit_after_step: int = 0            # test aid: hard-exit (like kill -9, no save/flush) after this step
@@ -87,6 +88,40 @@ def flops_per_sample(model, seq_len: int) -> float:
     n = count_params(model)["total"]
     c = model.llm.config
     return seq_len * (6 * n + 12 * c.num_hidden_layers * c.hidden_size * seq_len)
+
+
+def resolve_ckpt_dir(cfg, run: Path) -> str:
+    """Checkpoints go to $VLA_CKPT/<name>/ckpt when VLA_CKPT is set (RAM-backed on the server), else <run>/ckpt."""
+    if cfg.ckpt_dir:
+        return cfg.ckpt_dir
+    return str(Path(os.environ["VLA_CKPT"]) / cfg.name / "ckpt") if os.environ.get("VLA_CKPT") else str(run / "ckpt")
+
+
+def warm_start(model, path: str, say=print) -> dict:
+    """Load a full-state .pt (best.pt / stop_<step>.pt / final.pt) into `model` with strict=False, keeping only keys
+    that exist in the model with the same shape (e.g. discrete act_head.* and differing embedding rows are dropped).
+    Returns counts and the parameter prefixes left at their fresh initialisation (expect `dit` only)."""
+    sd = torch.load(path, map_location="cpu")
+    cur = model.state_dict()
+    keep, skipped_shape, skipped_missing = {}, [], []
+    for k, v in sd.items():
+        if k not in cur:
+            skipped_missing.append(k)
+        elif tuple(cur[k].shape) != tuple(v.shape):
+            skipped_shape.append(k)
+        else:
+            keep[k] = v.to(cur[k].dtype) if v.is_floating_point() else v
+    model.load_state_dict(keep, strict=False)
+    at_init: dict[str, int] = {}
+    for k in cur:
+        if k not in keep:
+            at_init[k.split(".")[0]] = at_init.get(k.split(".")[0], 0) + 1
+    info = {"n_loaded": len(keep), "n_skipped_shape": len(skipped_shape), "n_skipped_missing": len(skipped_missing),
+            "left_at_init_prefixes": at_init}
+    say(f"init_from {path}: loaded {info['n_loaded']}, skipped (shape) {info['n_skipped_shape']} "
+        f"{skipped_shape[:4]}, skipped (not in model) {info['n_skipped_missing']} {skipped_missing[:4]}; "
+        f"left at init: {at_init}")
+    return info
 
 
 def lr_at(step: int, total: int, warmup: int) -> float:
@@ -141,6 +176,12 @@ def main():
     mcfg = load_config(VLAConfig, cfg.model_config, mov)
     torch.manual_seed(cfg.seed)  # identical init on all ranks (FSDP2 shards from rank-consistent full params)
     model = VLA(mcfg)
+    if cfg.init_from:
+        resuming = a.resume and (Path(resolve_ckpt_dir(cfg, run)) / "latest").exists()
+        if resuming:
+            say(f"init_from ignored: --resume restores {resolve_ckpt_dir(cfg, run)}")
+        else:
+            warm_start(model, cfg.init_from, say)
     tok = model.tokenizer
     if not cuda:
         cfg.bf16 = False
@@ -194,8 +235,7 @@ def main():
     total = cfg.steps or int(cfg.epochs * steps_per_epoch)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: lr_at(s, total, cfg.warmup))
     # checkpoints (8 GB each) go to $VLA_CKPT/<name> (RAM-backed on the server) when set; only final.pt/metrics on home
-    ckpt_dir = cfg.ckpt_dir or (str(Path(os.environ["VLA_CKPT"]) / cfg.name / "ckpt") if os.environ.get("VLA_CKPT")
-                                else str(run / "ckpt"))
+    ckpt_dir = resolve_ckpt_dir(cfg, run)
     art_dir = Path(ckpt_dir).parent  # best.pt / stop_<step>.pt live here (RAM-backed $VLA_CKPT/<name> on the server)
     art_dir.mkdir(parents=True, exist_ok=True)
 
