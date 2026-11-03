@@ -122,7 +122,7 @@ The first-frame probe on validation episodes:
 | Discrete head | reach cos to expert | lift cos to expert | after colour swap: cos to the new cube / old cube | target position error |
 |---|---|---|---|---|
 | Before (`bc_disc`, image first, no aux loss) | 0.48 | 0.40 | 0.37 / 0.46 (reach): the swap barely moves the action | not measured |
-| Flow head, warm-started (`bc_gflow6`, step 500) | 0.96 | 0.94 | 0.94 / 0.03 (reach), 0.95 / 0.03 (lift) | 1.5 cm |
+| Flow head, warm-started (`bc_gflow6`, step 1,000) | 0.97 | 0.98 | 0.96 / 0.06 (reach), 0.97 / 0.06 (lift) | 1.1 cm |
 | After (`bc_gdisc3`, step 1,000, discrete) | 0.96 | 0.97 | 0.95 / 0.04 (reach), 0.97 / 0.06 (lift) | 1.3 cm |
 
 The probe gate requires a cosine of at least 0.9 on reach and lift and a colour swap that redirects the arm.
@@ -130,7 +130,8 @@ The probe gate requires a cosine of at least 0.9 on reach and lift and a colour 
 **Flow head.** Training the flow head from scratch with the same recipe did not escape the plateau by step 500,
 even with the auxiliary weight raised to 0.2. Its gradient norm in the first 200 steps was 30 to 55 (clipped to 1.0),
 against 5 to 20 for the discrete head. Warm-starting the flow model from the grounded discrete backbone
-(`init_from`, every weight except the freshly initialised DiT) passes the gate at step 500, as the table shows.
+(`init_from`, every weight except the freshly initialised DiT) passes the gate at step 500 (reach 0.96, lift 0.94)
+and ends as the strongest BC policy (table below).
 
 ## Setup
 
@@ -183,7 +184,7 @@ Every command below is run from the repository root with `.env` sourced.
    # grounded recipe (text-first prefix, aux position loss, colour swaps, early-frame oversampling)
    torchrun --nproc_per_node=4 -m vla.train.bc --config configs/bc_ground_disc.yaml
    # flow head warm-started from the grounded discrete model
-   torchrun --nproc_per_node=4 -m vla.train.bc --config configs/bc_ground_flow.yaml ground_weight=0.2 \
+   torchrun --nproc_per_node=4 -m vla.train.bc --config configs/bc_ground_flow.yaml name=bc_gflow6 ground_weight=0.2 \
        init_from=$VLA_CKPT/bc_gdisc3/best.pt
    # first-frame grounding probe (pass/fail gate)
    uv run python scripts/probe_grounding.py --ckpt $VLA_RUNS/bc_gdisc3/best.pt --head discrete \
@@ -265,12 +266,15 @@ The flow head samples noise, so a re-run of the same flow checkpoint moves by up
 | **BC, discrete head, grounded** (`bc_gdisc3`) | reach | **0.855** [0.80, 0.90] | **0.450** [0.38, 0.52] | **0.410** [0.34, 0.48] |
 | | lift | **0.610** [0.54, 0.67] | **0.290** [0.23, 0.36] | **0.285** [0.23, 0.35] |
 | | push | 0.460 [0.39, 0.53] | 0.205 [0.15, 0.27] | 0.245 [0.19, 0.31] |
-| BC, flow head, grounded (`bc_gflow6`) | all | TBD (training) | TBD | TBD |
+| **BC, flow head, grounded** (`bc_gflow6`, warm start) | reach | **0.965** [0.93, 0.98] | **0.545** [0.48, 0.61] | **0.550** [0.48, 0.62] |
+| | lift | **0.780** [0.72, 0.83] | **0.345** [0.28, 0.41] | **0.325** [0.26, 0.39] |
+| | push | 0.605 [0.54, 0.67] | 0.265 [0.21, 0.33] | 0.300 [0.24, 0.37] |
 | BC + RL (mean ± std over TBD seeds) | all | TBD | TBD | TBD |
 
 What the table shows:
-* Grounding lifts reach and lift success 3 to 6x on every split.
-* Push is unchanged within the intervals: it never depended on the colour word.
+* Grounding lifts reach and lift success 3 to 6x on every split, for both heads.
+* The grounded flow head is the best BC policy: 0.965 / 0.78 / 0.605 on train, and the smoothest (jerk 3.9 to 10.0).
+* Push improves little: it never depended on the colour word.
 * The gap between train and the held-out splits (0.855 to 0.45 on reach) is the target for RL post-training.
 
 End-effector jerk (RMS, lower is smoother):
@@ -335,12 +339,9 @@ Done:
 * Distributed BC with resumable checkpoints.
 * Evaluation and the grounding probe.
 * Grounded discrete BC model.
+* Grounded flow BC model (warm-started from the grounded discrete backbone).
 * The RL, inference and benchmark code paths exist and are covered by CPU tests (295 passing). Their GPU results are not
   measured yet.
-
-In progress:
-* Flow head, warm-started from the grounded discrete backbone: passed the 500-step gate; training to 1,200 steps,
-  then the 200-episode evaluation.
 
 Fixed along the way:
 * An rsync `--delete` removed the first set of result JSONs on the server. They were regenerated from the same
