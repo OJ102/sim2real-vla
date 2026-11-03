@@ -51,20 +51,41 @@ class _StaticDecoder:
                                past_key_values=self.cache, cache_position=self.cache_pos, use_cache=True)
         return self.m.act_head(out.last_hidden_state[:, -1]).float()
 
-    def capture(self) -> str:
-        if not self.embeds.is_cuda:
+    def _counters(self):
+        """HF StaticLayer.update ignores the cache_position we pass: it writes at its own device counter
+        `cumulative_length` (arange(kv_len) + counter) and increments it in place on every call, also inside a captured
+        graph. Warm-up steps therefore advance the counter; it must be restored or every later write lands at the wrong
+        slot (the first replayed decode step would write slot P+3 instead of P)."""
+        return [l.cumulative_length for l in self.cache.layers]
+
+    def _warmup(self, n: int = 3) -> None:
+        saved = [c.clone() for c in self._counters()]
+        for _ in range(n):
+            self.step()
+        for c, v in zip(self._counters(), saved):
+            c.copy_(v)
+
+    def capture(self, fake: bool = False) -> str:
+        """fake=True (CPU tests): run the warm-up + counter bookkeeping exactly as the CUDA path does, but capture nothing."""
+        if not self.embeds.is_cuda and not fake:
             self.graph_status = "cpu: no CUDA graphs"
+            return self.graph_status
+        if fake:
+            self._warmup()
+            self.graph_status = "fake capture (CPU bookkeeping test)"
             return self.graph_status
         try:
             s = torch.cuda.Stream()
             s.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(s):
-                for _ in range(3):  # warm up allocator/kernels outside capture
-                    self.step()
+                self._warmup()  # allocator/kernel warm-up outside capture; restores the cache write counters
             torch.cuda.current_stream().wait_stream(s)
             g = torch.cuda.CUDAGraph()
+            saved = [c.clone() for c in self._counters()]
             with torch.cuda.graph(g):
-                self.logits = self.step()
+                self.logits = self.step()  # captured, not executed
+            for c, v in zip(self._counters(), saved):  # nothing ran, but restore defensively
+                c.copy_(v)
             self.graph, self.graph_status = g, "captured"
         except Exception as e:  # noqa: BLE001  (e.g. a host sync inside mask creation)
             self.graph, self.graph_status = None, f"capture failed: {type(e).__name__}: {str(e)[:200]}"
@@ -78,10 +99,12 @@ class _StaticDecoder:
 
 
 class InferenceEngine:
-    def __init__(self, model: VLA, temperature: float = 1.0, mode: str = "eager", max_prefix: int | None = None):
+    def __init__(self, model: VLA, temperature: float = 1.0, mode: str = "eager", max_prefix: int | None = None,
+                 fake_capture: bool = False):
         assert model.cfg.head == "discrete", "flow rollout engine comes with P6b"
         assert mode in ("eager", "static", "graph")
         self.model, self.temperature, self.mode = model, temperature, mode
+        self.fake_capture = fake_capture  # CPU test hook: exercise the capture bookkeeping without CUDA graphs
         self.version = 0
         self.max_prefix = max_prefix
         self._dec: dict[int, _StaticDecoder] = {}
@@ -140,7 +163,7 @@ class InferenceEngine:
             if self.mode == "graph" and dec.graph is None and dec.graph_status == "not captured":
                 # capture after prefill so the cache/mask buffers are in a valid state; step() warmup only touches slot P
                 dec.cache_pos.fill_(P); dec.pos.fill_(0); dec.embeds.zero_(); dec.mask[:, P] = 1
-                dec.capture()
+                dec.capture(fake=self.fake_capture)
                 dec.mask[:, P] = 0
             valid = mask.sum(1)
             logits = m.act_head(h).float()
