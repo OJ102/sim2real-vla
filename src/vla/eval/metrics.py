@@ -40,6 +40,18 @@ def episode_metrics(actions: np.ndarray, infos: list[dict]) -> dict:
             "collision_viol": int(col.sum())}
 
 
+def _ms(vals) -> dict:
+    return {"mean": float(np.mean(vals)), "std": float(np.std(vals))}
+
+
+def reward_summary(eps: list[dict]) -> dict:
+    """Per-episode reward components (signed, DEFAULT_WEIGHTS) and raw unweighted sums -> mean/std."""
+    comps = [k[2:] for k in eps[0] if k.startswith("R_")]
+    return {"total": _ms([e["reward_total"] for e in eps]),
+            "components": {c: _ms([e[f"R_{c}"] for e in eps]) for c in comps},
+            "raw_sums": {c: _ms([e[f"raw_{c}"] for e in eps]) for c in comps if c != "success"}}
+
+
 def aggregate(eps: list[dict], ceiling: float | None = None) -> dict:
     n = len(eps)
     k = sum(e["success"] for e in eps)
@@ -48,6 +60,8 @@ def aggregate(eps: list[dict], ceiling: float | None = None) -> dict:
            "ee_jerk_rms": m("ee_jerk_rms"), "action_2nd_diff": m("action_2nd_diff"),
            "joint_limit_viol_per_ep": m("joint_limit_viol"), "vel_viol_per_ep": m("vel_viol"),
            "collision_viol_per_ep": m("collision_viol")}
+    if n and "reward_total" in eps[0]:
+        out["reward_components"] = reward_summary(eps)
     if ceiling:
         out["expert_ceiling"] = ceiling
         out["success_vs_ceiling"] = out["success"] / ceiling

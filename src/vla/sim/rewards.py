@@ -30,12 +30,10 @@ QD_MAX = np.array([2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61])  # Panda joint
 DEFAULT_WEIGHTS = {"success": 10.0, "jerk_act": 0.5, "jerk_ee": 50.0, "limit": 0.05, "vel": 0.1, "collision": 0.1}
 
 
-def episode_return(actions, infos, w: dict | None = None):
-    """R = 10*success - l_j*sum||a_t-2a_{t-1}+a_{t-2}||^2 - l_jk*sum||d3 ee||^2 - l_lim*sum 1[q within 5% of limit]
-           - l_vel*sum relu(|qd|-0.8 qd_max) - l_col*sum 1[arm-table or arm-distractor contact].
-    actions [T,4] executed, infos: per-step dicts (ee_pos, qpos, qvel, contacts, success).
-    Returns (R, {component: signed contribution}). Each term is reported separately."""
-    w = {**DEFAULT_WEIGHTS, **(w or {})}
+def episode_terms(actions, infos) -> dict:
+    """Raw, unweighted episode sums (so lambda can be retuned without re-running): sum||d2a||^2, sum||d3 ee||^2,
+    number of steps within 5% of a joint limit, sum relu(|qd|-0.8 qd_max), number of arm-table/arm-distractor
+    contact steps, and success."""
     a = np.asarray(actions, dtype=np.float64)
     ee = np.stack([i["ee_pos"] for i in infos]).astype(np.float64)
     q = np.stack([i["qpos"] for i in infos])
@@ -45,12 +43,18 @@ def episode_return(actions, infos, w: dict | None = None):
     margin = 0.05 * (JOINT_HI - JOINT_LO)
     near = ((q < JOINT_LO + margin) | (q > JOINT_HI - margin)).any(-1)
     col = np.array([(i["contacts"]["arm_table"] + i["contacts"]["arm_distractor"]) > 0 for i in infos])
-    comp = {
-        "success": w["success"] * float(infos[-1]["success"]),
-        "jerk_act": -w["jerk_act"] * float((d2a**2).sum()),
-        "jerk_ee": -w["jerk_ee"] * float((d3e**2).sum()),
-        "limit": -w["limit"] * float(near.sum()),
-        "vel": -w["vel"] * float(np.maximum(np.abs(qd) - 0.8 * QD_MAX, 0).sum()),
-        "collision": -w["collision"] * float(col.sum()),
-    }
+    return {"success": float(infos[-1]["success"]), "jerk_act": float((d2a**2).sum()),
+            "jerk_ee": float((d3e**2).sum()), "limit": float(near.sum()),
+            "vel": float(np.maximum(np.abs(qd) - 0.8 * QD_MAX, 0).sum()), "collision": float(col.sum())}
+
+
+def episode_return(actions, infos, w: dict | None = None):
+    """R = 10*success - l_j*sum||a_t-2a_{t-1}+a_{t-2}||^2 - l_jk*sum||d3 ee||^2 - l_lim*sum 1[q within 5% of limit]
+           - l_vel*sum relu(|qd|-0.8 qd_max) - l_col*sum 1[arm-table or arm-distractor contact].
+    actions [T,4] executed, infos: per-step dicts (ee_pos, qpos, qvel, contacts, success).
+    Returns (R, {component: signed contribution}). Each term is reported separately."""
+    w = {**DEFAULT_WEIGHTS, **(w or {})}
+    r = episode_terms(actions, infos)
+    comp = {"success": w["success"] * r["success"]}
+    comp.update({k: -w[k] * r[k] for k in ("jerk_act", "jerk_ee", "limit", "vel", "collision")})
     return float(sum(comp.values())), comp

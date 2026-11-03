@@ -18,6 +18,7 @@ import time
 import numpy as np
 
 from vla.eval.metrics import aggregate, episode_metrics, load_ceiling
+from vla.sim.rewards import episode_return, episode_terms
 from vla.sim.vec_env import SubprocVecEnv
 from vla.utils.gpu import quiet_wait, snapshot, visible_gpus
 
@@ -25,7 +26,17 @@ SPLITS = ("train", "heldout", "heldout_photo")
 EVAL_SEED0 = 1000
 
 
-def run_vla(vec, policy, task, split, seeds, horizon, max_steps=100):
+def ep_metrics(actions, infos, reward_components: bool) -> dict:
+    m = episode_metrics(actions, infos)
+    if reward_components:  # DEFAULT_WEIGHTS; signed components + raw unweighted sums
+        r, comp = episode_return(actions, infos)
+        m["reward_total"] = r
+        m.update({f"R_{k}": v for k, v in comp.items()})
+        m.update({f"raw_{k}": v for k, v in episode_terms(actions, infos).items()})
+    return m
+
+
+def run_vla(vec, policy, task, split, seeds, horizon, max_steps=100, reward_components=False):
     """Rollout waves of len(vec) episodes. Returns list of episode metric dicts."""
     out = []
     for w in range(0, len(seeds), vec.n):
@@ -50,34 +61,39 @@ def run_vla(vec, policy, task, split, seeds, horizon, max_steps=100):
                 if term or trunc:
                     active.discard(i)
             t += 1
-        out += [episode_metrics(np.stack(acts[i]), infos[i]) for i in idx]
+        out += [ep_metrics(np.stack(acts[i]), infos[i], reward_components) for i in idx]
     return out
 
 
-def run_expert(vec, task, split, seeds, noise=0.05):
+def run_expert(vec, task, split, seeds, noise=0.05, reward_components=False):
     out = []
     for w in range(0, len(seeds), vec.n):
         wseeds = seeds[w:w + vec.n]
         idx = list(range(len(wseeds)))
         for traj in vec.expert_episodes(idx, task, split, wseeds, noise):
-            out.append(episode_metrics(np.stack([a for a, _ in traj]), [i for _, i in traj]))
+            out.append(ep_metrics(np.stack([a for a, _ in traj]), [i for _, i in traj], reward_components))
     return out
 
 
-def evaluate(policy, vec, splits, tasks, episodes, horizon, ceiling, seed0=EVAL_SEED0, log=print):
+def evaluate(policy, vec, splits, tasks, episodes, horizon, ceiling, seed0=EVAL_SEED0, log=print,
+             reward_components=False):
     results = {}
     for split in splits:
         results[split] = {}
         for task in tasks:
             seeds = list(range(seed0, seed0 + episodes))
             t0 = time.time()
-            eps = run_expert(vec, task, split, seeds) if policy is None else \
-                run_vla(vec, policy, task, split, seeds, horizon)
+            eps = run_expert(vec, task, split, seeds, reward_components=reward_components) if policy is None else \
+                run_vla(vec, policy, task, split, seeds, horizon, reward_components=reward_components)
             agg = aggregate(eps, ceiling.get(split, {}).get(task, {}).get("success"))
             agg["eval_secs"] = time.time() - t0
             results[split][task] = agg
             log(f"{split}/{task}: success {agg['success']:.3f} CI [{agg['ci95'][0]:.2f},{agg['ci95'][1]:.2f}] "
                 f"n={agg['n']} jerk {agg['ee_jerk_rms']:.1f} ({agg['eval_secs']:.0f}s)")
+            if "reward_components" in agg:
+                rc = agg["reward_components"]
+                log(f"  reward {split}/{task}: R {rc['total']['mean']:.2f}±{rc['total']['std']:.2f} | " + " ".join(
+                    f"{k} {v['mean']:.2f}" for k, v in rc["components"].items()))
     return results
 
 
@@ -97,6 +113,9 @@ def main():
     ap.add_argument("--device", default=None)
     ap.add_argument("--bf16", action="store_true")
     ap.add_argument("--quiet-wait", action="store_true")
+    ap.add_argument("--reward-components", action="store_true",
+                    help="also compute the RL reward components (DEFAULT_WEIGHTS) and raw sums per episode; output JSON gains "
+                         "results[split][task]['reward_components']")
     ap.add_argument("--ceiling", default="results/expert_ceiling.json")
     ap.add_argument("--out", default=None)
     ap.add_argument("--override", nargs="*", default=[], help="model config key=value (e.g. attn_impl=eager)")
@@ -120,7 +139,7 @@ def main():
     vec = SubprocVecEnv(a.n_envs)
     try:
         res = evaluate(policy, vec, a.splits.split(","), a.tasks.split(","), a.episodes, a.exec_horizon,
-                       load_ceiling(a.ceiling), a.seed0)
+                       load_ceiling(a.ceiling), a.seed0, reward_components=a.reward_components)
     finally:
         vec.close()
     meta["gpu_snapshot_after"] = snapshot()

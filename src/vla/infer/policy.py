@@ -17,6 +17,13 @@ def load_weights(model: VLA, path: str) -> None:
     p = Path(path)
     if p.is_file():
         sd = torch.load(p, map_location="cpu")
+        if getattr(model, "ground_head", None) is None:
+            # the ground head is a BC-only aux loss; RL / inference build the model with ground_weight=0
+            dropped = [k for k in sd if k.startswith("ground_head.")]
+            if dropped:
+                sd = {k: v for k, v in sd.items() if not k.startswith("ground_head.")}
+                print(f"load_weights: dropped {len(dropped)} ground_head.* keys (model has no ground head); "
+                      f"all other keys strict", flush=True)
         missing, unexpected = model.load_state_dict({k: v.float() if v.is_floating_point() else v
                                                      for k, v in sd.items()}, strict=False)
         bad = [k for k in missing if not k.startswith("act_head")]
