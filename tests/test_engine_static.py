@@ -197,3 +197,59 @@ def test_gpu_graph_replays_equal_static_on_new_inputs():
         b = {k: v.cuda() for k, v in batch(m, INSTR, seed=seed).items()}
         a, c = g.generate(b, greedy=True), s.generate(b, greedy=True)
         assert (a["bins"] == c["bins"]).float().mean() > 0.99 and (a["logp"] - c["logp"]).abs().max() < 1e-2
+
+
+# ------------------------------------------------------------------ graph-capture bookkeeping regression (bd6c014)
+@pytest.mark.parametrize("order", ["img_first", "txt_first"])
+def test_fake_capture_graph_matches_eager_every_call_and_counters(order):
+    """HF StaticLayer.update writes at its own device counter `cumulative_length`; capture warm-up must not leave it shifted."""
+    torch.manual_seed(0)
+    m = VLA(load_config(VLAConfig, str(ROOT / "configs/model_tiny.yaml"), [f"prefix_order={order}"])).eval()
+    with torch.no_grad():
+        w = m.llm.get_input_embeddings().weight
+        w[m.act_base:] = torch.randn(256, w.shape[1], generator=torch.Generator().manual_seed(7)) * 0.5
+        w[m.act_base:] *= 30                                                  # peaked action logits
+    eng = InferenceEngine(m, 1.0, "graph", max_prefix=n_prefix(m) + 40, fake_capture=True)
+    ea = InferenceEngine(m, 1.0, "eager")
+    b1 = batch(m, ["reach it", "lift the red cube", "push the blue cube to the yellow zone"], seed=1)
+    b2 = batch(m, ["push the blue cube to the yellow zone, slowly please", "a", "lift the green cube"], seed=2)
+    for call, b in enumerate((b1, b2, b1)):
+        got, ref = eng.generate(b, greedy=True), ea.generate(b, greedy=True)
+        assert torch.equal(got["bins"], ref["bins"]), (order, call)
+        assert (got["logp"] - ref["logp"]).abs().max() < 1e-5, (order, call, (got["logp"] - ref["logp"]).abs().max())
+        P = int(b["input_ids"].shape[1]) + n_prefix(m)
+        dec = eng._dec[3]
+        assert all(int(c) == P + 15 for c in dec.counters()) if hasattr(dec, "counters") else \
+            all(int(l.cumulative_length) == P + 15 for l in dec.cache.layers), (order, call, P)
+    assert any("fake capture" in s for s in eng.graph_status.values()), eng.graph_status
+
+
+# ------------------------------------------------------------------ GPU: real graph vs eager, mixed prompts, in-place weight update
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("order", ["img_first", "txt_first"])
+def test_gpu_graph_vs_eager_mixed_prompts_and_weight_copy(order):
+    torch.manual_seed(0)
+    m = VLA(load_config(VLAConfig, str(ROOT / "configs/model_tiny.yaml"), [f"prefix_order={order}"])).eval()
+    with torch.no_grad():
+        w = m.llm.get_input_embeddings().weight
+        w[m.act_base:] = torch.randn(256, w.shape[1], generator=torch.Generator().manual_seed(7)) * 0.5 * 30
+    m = m.cuda().to(torch.bfloat16)
+    mk = lambda ins, s: {k: v.cuda() for k, v in batch(m.cpu() if False else m, ins, seed=s).items()}   # noqa: E731
+    eng = InferenceEngine(m, 1.0, "graph", max_prefix=n_prefix(m) + 40); ea = InferenceEngine(m, 1.0, "eager")
+    bs = [mk(["reach it", "lift the red cube", "push the blue cube to the yellow zone"], 1),
+          mk(["push the blue cube to the yellow zone, slowly please", "a", "lift the green cube"], 2)]
+    bs.append(bs[0])
+    for b in bs:
+        g, e = eng.generate(b, greedy=True), ea.generate(b, greedy=True)
+        assert (g["bins"] == e["bins"]).float().mean() == 1.0 and (g["logp"] - e["logp"]).abs().max() < 1e-2
+    st = list(eng.graph_status.values())[0]
+    if st != "captured":
+        pytest.skip(f"graph capture did not succeed: {st}")
+    ptrs = [p.data_ptr() for p in m.parameters()]
+    with torch.no_grad():
+        for p in m.parameters():
+            p.add_(0.01 * torch.randn_like(p))
+    assert [p.data_ptr() for p in m.parameters()] == ptrs
+    for b in bs:
+        g, e = eng.generate(b, greedy=True), ea.generate(b, greedy=True)
+        assert (g["bins"] == e["bins"]).float().mean() == 1.0 and (g["logp"] - e["logp"]).abs().max() < 1e-2
