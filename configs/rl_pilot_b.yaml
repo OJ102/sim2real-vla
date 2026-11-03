@@ -1,0 +1,24 @@
+# RL pilot B (docs/PLAN_v2_rl.md): seed 0, 35 iterations, 64 eps/iter, T=1, lr 2e-6, engine graph.
+# set init_ckpt / data_dir via overrides (same as rl.yaml)
+name: rl_pilot_b
+model_config: configs/model_0p5b_txt.yaml   # grounded BC inits (bc_gdisc3 / bc_gflow6) are text-first
+head: discrete
+n_learner: 1
+n_rollout: 1
+staleness: 1
+iterations: 35
+tasks: [lift, push]
+seeds_per_iter: 8
+group_size: 8
+lr: 2.0e-6
+# init_ckpt: $VLA_RUNS/bc_gdisc3/best.pt (ground_head.* dropped on load) ; data_dir: $VLA_DATA/demos (set via overrides)
+engine_mode: graph   # main RL seeds ran with static (== eager bit-exact). graph was fixed in bd6c014 (GPU-verified: 1.0 token agreement) and is used in the throughput study via engine_mode=graph.
+# Penalty weights retuned from measured BC reward components (results/rew_*.json, 100 eps, 2026-11-03):
+# at the v1 default jerk_act=0.5 the action-jerk term was -19..-69 per episode for bc_gdisc3 (std ~50) against +10 for
+# success, so group advantages would rank smoothness over success. 0.02 puts it at ~-0.4..-2.7 (std ~2, ~0.4x the
+# success std) and the expert at ~-0.01..-0.25. jerk_ee (-0.02..-1.6) and the other terms are already small.
+reward_weights: {success: 10.0, jerk_act: 0.02, jerk_ee: 50.0, limit: 0.05, vel: 0.1, collision: 0.1}
+
+opt_steps_per_iter: 4
+loss_norm: episode        # pilot B: each episode equal total weight (removes the failed-episode length bias)
+adv_std_floor: 1.0

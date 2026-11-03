@@ -9,11 +9,23 @@ from __future__ import annotations
 import torch
 
 
-def group_advantages(rewards: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """rewards [n_groups, G] -> (R - group mean) / (group std + eps), same shape."""
+def group_advantages(rewards: torch.Tensor, eps: float = 1e-6, std_floor: float = 0.0) -> torch.Tensor:
+    """rewards [n_groups, G] -> (R - group mean) / (group std + eps), same shape. std_floor > 0 switches to
+    (R - mean) / max(std, std_floor): groups with (near-)identical returns then get advantages ~0 instead of unit scale."""
     mean = rewards.mean(dim=1, keepdim=True)
     std = rewards.std(dim=1, unbiased=False, keepdim=True)
+    if std_floor > 0:
+        return (rewards - mean) / std.clamp(min=std_floor)
     return (rewards - mean) / (std + eps)
+
+
+def adapt_beta(beta: float, kl: float, kl_target: float, lo: float = 0.005, hi: float = 1.0) -> float:
+    """Per-iteration KL controller: KL > 1.5*target -> beta*1.5; KL < target/1.5 -> beta/1.5; clamp [lo, hi]."""
+    if kl > 1.5 * kl_target:
+        beta *= 1.5
+    elif kl < kl_target / 1.5:
+        beta /= 1.5
+    return float(min(max(beta, lo), hi))
 
 
 def tis_weight(logp_old: torch.Tensor, logp_beh: torch.Tensor, cap: float = 2.0) -> torch.Tensor:
@@ -32,8 +44,12 @@ def _masked_mean(x: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
 
 
 def grpo_loss(logp_new, logp_old, logp_beh, logp_ref, adv, mask=None, clip_eps: float = 0.2, beta: float = 0.02,
-              tis_cap: float = 2.0, use_tis: bool = True, kl=None):
-    """All tensors [B, T] except adv [B] or [B, T] (episode advantage broadcast over tokens). Returns (loss, metrics)."""
+              tis_cap: float = 2.0, use_tis: bool = True, kl=None, sample_w=None, w_total=None):
+    """All tensors [B, T] except adv [B] or [B, T] (episode advantage broadcast over tokens). Returns (loss, metrics).
+    Episode normalisation: pass sample_w [B] (1 / episode chunk count) and w_total (sum of sample_w over the WHOLE
+    minibatch, computed before micro-batching): loss = sum_i sample_w_i * mean_t(l_it) / w_total, so every episode
+    contributes equal total weight however long it ran, and the KL term is weighted identically. The caller then must
+    not rescale by micro-batch size. Default (None) = token mean, unchanged."""
     if adv.dim() == 1:
         adv = adv[:, None].expand_as(logp_new)
     ratio = torch.exp(logp_new - logp_old.detach())
@@ -41,7 +57,10 @@ def grpo_loss(logp_new, logp_old, logp_beh, logp_ref, adv, mask=None, clip_eps: 
     w = tis_weight(logp_old, logp_beh, tis_cap) if use_tis else torch.ones_like(ratio)
     if kl is None:  # discrete tokens: k3 estimator; flow: pass the closed-form per-step Gaussian KL
         kl = kl_k3(logp_new, logp_ref.detach())
-    loss = _masked_mean(-pg * w + beta * kl, mask)
+    if sample_w is not None:
+        loss = (((-pg * w + beta * kl).mean(1)) * sample_w).sum() / w_total
+    else:
+        loss = _masked_mean(-pg * w + beta * kl, mask)
     with torch.no_grad():
         raw = torch.exp(logp_old - logp_beh)
         metrics = {

@@ -162,7 +162,8 @@ class VLA(nn.Module):
         if "x_next" in batch:  # Flow-GRPO path: per-denoising-step Gaussian log-probs (+ means for the closed-form KL)
             return self.flow_rl_logp(batch)
         if "bins" in batch:  # RL path: per-token log-probs; goes through forward() so FSDP2 root hooks fire
-            return {"logp": self.token_logprobs(batch, batch["bins"], batch.get("temperature", 1.0))}
+            lp, ent = self._token_logprobs_ent(batch, batch["bins"], batch.get("temperature", 1.0))
+            return {"logp": lp, "entropy": ent}
         prefix, mask = self.embed_prefix(batch)
         P = prefix.shape[1]
         if self.cfg.head == "flow":
@@ -240,9 +241,14 @@ class VLA(nn.Module):
     def token_logprobs(self, batch: dict, bins: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
         """Per-token log pi(bin | prefix, previous bins) over the action vocabulary: [B, n_act_tokens].
         Uses softmax(logits / temperature), the same distribution InferenceEngine samples from, so mu == pi_old."""
+        return self._token_logprobs_ent(batch, bins, temperature)[0]
+
+    def _token_logprobs_ent(self, batch: dict, bins: torch.Tensor, temperature: float = 1.0):
+        """-> (log-prob of the given bins [B,T], detached entropy of each token's 256-way distribution [B,T])."""
         prefix, mask = self.embed_prefix(batch)
         logp = F.log_softmax(self._discrete_logits(prefix, mask, bins)[0] / temperature, dim=-1)
-        return logp.gather(-1, bins[..., None]).squeeze(-1)
+        ent = -(logp.detach().exp() * logp.detach()).sum(-1)
+        return logp.gather(-1, bins[..., None]).squeeze(-1), ent
 
     # ------------------------------------------------------------------ inference
     @torch.no_grad()

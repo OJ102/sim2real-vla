@@ -52,6 +52,11 @@ class RLConfig:
     max_prompt_tokens: int = 32         # static-cache sizing: fixed prefix budget so one CUDA graph serves all batches
     lr: float = 2.0e-6
     epochs: int = 2
+    opt_steps_per_iter: int = 0         # k>0: ONE pass in exactly k minibatches (overrides epochs/minibatch); 0 = off
+    loss_norm: str = "token"            # token (mean over tokens) | episode (each episode equal total weight, KL included)
+    adv_std_floor: float = 0.0          # >0: adv = (R-mean)/max(std, floor) instead of /(std+1e-6)
+    kl_target: float = 0.0              # >0 with beta_adapt: per-iteration KL controller on beta (x1.5 / /1.5, clamp [0.005, 1])
+    beta_adapt: bool = False
     minibatch: int = 64
     micro_batch: int = 16
     clip_eps: float = 0.2
