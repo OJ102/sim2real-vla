@@ -7,7 +7,7 @@ analysed against the hardware limits. The policy itself is small and the tasks a
 
 Numbers in this README come from measured runs; anything not yet measured is marked `TBD`. The final tables are
 rendered by `scripts/make_tables.py` from the JSON files in `results/` into `results/tables.md`. The behaviour-cloning
-numbers below were transcribed from the evaluation logs; their JSON files are being regenerated (see Status).
+numbers below come from `results/eval_bc_*.json` and `results/probe_bc_*.json`.
 Nothing here claims a multi-node run: launches are multi-node-ready (`torchrun` with a c10d rendezvous), but every
 reported result is single-node on four A100s that were shared with other users.
 
@@ -121,15 +121,16 @@ The first-frame probe on validation episodes:
 
 | Discrete head | reach cos to expert | lift cos to expert | after colour swap: cos to the new cube / old cube | target position error |
 |---|---|---|---|---|
-| Before (image first, no aux loss) | 0.48 | TBD (JSON being regenerated) | unchanged by the swap | not measured |
-| After (`bc_gdisc3`, step 1,000) | 0.96 | 0.97 | 0.95 / 0.04 (reach), 0.97 / 0.06 (lift) | 1.3 cm |
+| Before (`bc_disc`, image first, no aux loss) | 0.48 | 0.40 | 0.37 / 0.46 (reach): the swap barely moves the action | not measured |
+| Flow head, warm-started (`bc_gflow6`, step 500) | 0.96 | 0.94 | 0.94 / 0.03 (reach), 0.95 / 0.03 (lift) | 1.5 cm |
+| After (`bc_gdisc3`, step 1,000, discrete) | 0.96 | 0.97 | 0.95 / 0.04 (reach), 0.97 / 0.06 (lift) | 1.3 cm |
 
 The probe gate requires a cosine of at least 0.9 on reach and lift and a colour swap that redirects the arm.
 
 **Flow head.** Training the flow head from scratch with the same recipe did not escape the plateau by step 500,
 even with the auxiliary weight raised to 0.2. Its gradient norm in the first 200 steps was 30 to 55 (clipped to 1.0),
-against 5 to 20 for the discrete head. A warm start from the grounded discrete backbone (`init_from`) is being
-evaluated. See Status.
+against 5 to 20 for the discrete head. Warm-starting the flow model from the grounded discrete backbone
+(`init_from`, every weight except the freshly initialised DiT) passes the gate at step 500, as the table shows.
 
 ## Setup
 
@@ -248,6 +249,7 @@ Measured cells are filled in; `TBD` cells are not measured yet.
 ### Policy results (closed loop, 200 episodes per task and split, fixed seeds)
 
 Success rate with 95% Wilson interval. The GPUs were shared during the BC evaluations; that affects timing only, not success.
+The flow head samples noise, so a re-run of the same flow checkpoint moves by up to about 0.04 (inside the interval).
 
 | Policy | Task | Train | Held-out | Held-out photo |
 |---|---|---|---|---|
@@ -257,13 +259,13 @@ Success rate with 95% Wilson interval. The GPUs were shared during the BC evalua
 | BC, discrete head (baseline) | reach | 0.150 [0.11, 0.21] | 0.125 [0.09, 0.18] | 0.135 [0.09, 0.19] |
 | | lift | 0.125 [0.09, 0.18] | 0.085 [0.05, 0.13] | 0.085 [0.05, 0.13] |
 | | push | 0.490 [0.42, 0.56] | 0.260 [0.20, 0.32] | 0.285 [0.23, 0.35] |
-| BC, flow head (baseline) | reach | 0.180 [0.13, 0.24] | 0.100 [0.07, 0.15] | 0.105 [0.07, 0.16] |
-| | lift | 0.130 [0.09, 0.18] | 0.090 [0.06, 0.14] | 0.065 [0.04, 0.11] |
-| | push | 0.545 [0.48, 0.61] | 0.255 [0.20, 0.32] | 0.215 [0.16, 0.28] |
+| BC, flow head (baseline) | reach | 0.185 [0.14, 0.24] | 0.120 [0.08, 0.17] | 0.125 [0.09, 0.18] |
+| | lift | 0.165 [0.12, 0.22] | 0.060 [0.03, 0.10] | 0.065 [0.04, 0.11] |
+| | push | 0.530 [0.46, 0.60] | 0.245 [0.19, 0.31] | 0.245 [0.19, 0.31] |
 | **BC, discrete head, grounded** (`bc_gdisc3`) | reach | **0.855** [0.80, 0.90] | **0.450** [0.38, 0.52] | **0.410** [0.34, 0.48] |
 | | lift | **0.610** [0.54, 0.67] | **0.290** [0.23, 0.36] | **0.285** [0.23, 0.35] |
 | | push | 0.460 [0.39, 0.53] | 0.205 [0.15, 0.27] | 0.245 [0.19, 0.31] |
-| BC, flow head, grounded | all | TBD | TBD | TBD |
+| BC, flow head, grounded (`bc_gflow6`) | all | TBD (training) | TBD | TBD |
 | BC + RL (mean ± std over TBD seeds) | all | TBD | TBD | TBD |
 
 What the table shows:
@@ -337,10 +339,12 @@ Done:
   measured yet.
 
 In progress:
-* Flow head, warm-started from the grounded discrete backbone: 500-step probe gate running.
-* The behaviour-cloning result JSONs (`eval_bc_*.json`, `probe_bc_*.json`) were deleted on the server by an rsync
-  `--delete` before they were copied off. The success numbers above come from the evaluation logs. The JSONs will be
-  regenerated (about 15 minutes per model on one GPU), and `sync.sh` now protects `results/`.
+* Flow head, warm-started from the grounded discrete backbone: passed the 500-step gate; training to 1,200 steps,
+  then the 200-episode evaluation.
+
+Fixed along the way:
+* An rsync `--delete` removed the first set of result JSONs on the server. They were regenerated from the same
+  checkpoints, and `sync.sh` now protects `results/`.
 
 Next:
 * Checkpoint-stall study, memory table and scaling sweep.
