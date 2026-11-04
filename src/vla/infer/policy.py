@@ -43,7 +43,8 @@ class VLAPolicy:
     """act(images [B,H,W,3] u8, proprio [B,11] raw, instructions) -> actions [B,chunk,4] in [-1,1]."""
 
     def __init__(self, model_config: str, ckpt: str | None, stats_path: str | None, head: str = "",
-                 device: str = "cpu", dtype=torch.float32, overrides: list[str] | None = None):
+                 device: str = "cpu", dtype=torch.float32, overrides: list[str] | None = None,
+                 temperature: float | None = None):
         ov = ([f"head={head}"] if head else []) + (overrides or [])
         self.cfg = load_config(VLAConfig, model_config, ov)
         self.model = VLA(self.cfg)
@@ -56,12 +57,27 @@ class VLAPolicy:
             st = json.load(open(stats_path))
             self.p_mean = np.array(st["proprio_mean"], np.float32)
             self.p_std = np.array(st["proprio_std"], np.float32)
+        # temperature=None: greedy via model.predict (unchanged path). Discrete + T: sample softmax(logits/T)
+        self.engine = None
+        if temperature is not None and self.cfg.head == "discrete":
+            if not temperature > 0:
+                raise ValueError(f"temperature must be > 0, got {temperature}")
+            from vla.infer.engine import InferenceEngine
+            # same static-cache budget as RL rollouts (rl/rollout_worker.py, GRPOConfig.max_prompt_tokens=32)
+            self.engine = InferenceEngine(self.model, temperature=temperature, mode="static",
+                                          max_prefix=(self.cfg.image_size // 16) ** 2 + 1 + 32)
+
+    def make_generator(self, seed: int) -> torch.Generator:
+        return torch.Generator(device=self.device).manual_seed(seed)
 
     @torch.no_grad()
-    def act(self, images: np.ndarray, proprio: np.ndarray, instructions: list[str], greedy: bool = True) -> np.ndarray:
+    def act(self, images: np.ndarray, proprio: np.ndarray, instructions: list[str], greedy: bool = True,
+            generator: torch.Generator | None = None) -> np.ndarray:
         if self.p_mean is not None:
             proprio = (proprio - self.p_mean) / self.p_std
         batch = {"image": torch.from_numpy(images).to(self.device),
                  "proprio": torch.from_numpy(proprio.astype(np.float32)).to(self.device),
                  **{k: v.to(self.device) for k, v in encode_instructions(self.model.tokenizer, instructions).items()}}
+        if self.engine is not None:
+            return self.engine.generate(batch, greedy=False, generator=generator)["actions"].float().cpu().numpy()
         return self.model.predict(batch).float().cpu().numpy()
