@@ -1,0 +1,28 @@
+# P6b Flow-GRPO (docs/PLAN_v2.md P6b, gate passed 2026-11-04: rl2 mean dT1 +0.083 over 3 seeds, KL <= 0.06).
+# Same recipe as the winning discrete pilot C (configs/rl_pilot_c.yaml) on the flow head:
+# SDE rollouts (sigma_t = a*sqrt(t/(1-t)), a=0.7, K=5 steps), per-denoising-step Gaussian log-probs, closed-form KL.
+# Backbone frozen, only the DiT trains (train_backbone false). Eval uses the 10-step ODE.
+# set init_ckpt ($VLA_RUNS/bc_gflow6/best.pt) / data_dir via overrides.
+name: rl_flow
+model_config: configs/model_0p5b_txt.yaml
+head: flow
+n_learner: 1
+n_rollout: 1
+staleness: 1
+iterations: 80
+tasks: [lift, push]
+seeds_per_iter: 8
+group_size: 8
+lr: 2.0e-6
+engine_mode: static
+flow_sde_a: 0.7
+flow_steps_rl: 5
+train_backbone: false
+reward_weights: {success: 10.0, jerk_act: 0.02, jerk_ee: 50.0, limit: 0.05, vel: 0.1, collision: 0.1}
+
+opt_steps_per_iter: 4
+loss_norm: episode
+adv_std_floor: 1.0
+beta: 0.05
+kl_target: 0.05
+beta_adapt: true
