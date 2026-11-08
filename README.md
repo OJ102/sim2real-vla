@@ -215,11 +215,23 @@ Every command below is run from the repository root with `.env` sourced.
 5. **RL post-training**
 
    ```bash
-   torchrun --nproc_per_node=2 -m vla.rl.grpo --config configs/rl.yaml name=rl_disc_seed0 seed=0 \
-       init_ckpt=$VLA_RUNS/bc_disc/final.pt data_dir=$VLA_DATA/demos staleness=1
+   # final discrete recipe (pilot C), 80 iterations, from the grounded discrete BC model
+   torchrun --nproc_per_node=2 -m vla.rl.grpo --config configs/rl_pilot_c.yaml name=rl2_s0 seed=0 iterations=80 \
+       init_ckpt=$VLA_RUNS/bc_gdisc3/best.pt data_dir=$VLA_DATA/demos
+   # no-learning control on the identical rollout seed schedule (for paired comparisons)
+   torchrun --nproc_per_node=2 -m vla.rl.grpo --config configs/rl_pilot_c.yaml name=ctrl_disc_lr0 seed=0 iterations=80 \
+       lr=0.0 init_ckpt=$VLA_RUNS/bc_gdisc3/best.pt data_dir=$VLA_DATA/demos
+   # Flow-GRPO on the grounded flow model
+   torchrun --nproc_per_node=2 -m vla.rl.grpo --config configs/rl_flow.yaml name=rlf_s0 seed=0 \
+       init_ckpt=$VLA_RUNS/bc_gflow6/best.pt data_dir=$VLA_DATA/demos
+   # sampled evaluation next to greedy
+   uv run python -m vla.eval.rollout_eval --policy vla --ckpt $VLA_RUNS/rl2_s0/final.pt \
+       --model-config configs/model_0p5b_txt.yaml --head discrete --data-dir $VLA_DATA/demos \
+       --splits train,heldout,heldout_photo --tasks reach,lift,push --episodes 200 --n-envs 32 --bf16 \
+       --reward-components --temperature 1.0 --out results/evalT1_rl2_s0.json
    ```
 
-   `staleness=0` is the serial on-policy baseline. `head=flow` selects Flow-GRPO.
+   `staleness=0` is the serial on-policy baseline. Sampled results depend on `--n-envs` (one generator per wave).
 
 6. **Training-system measurements**
 
@@ -269,7 +281,12 @@ The flow head samples noise, so a re-run of the same flow checkpoint moves by up
 | **BC, flow head, grounded** (`bc_gflow6`, warm start) | reach | **0.965** [0.93, 0.98] | **0.545** [0.48, 0.61] | **0.550** [0.48, 0.62] |
 | | lift | **0.780** [0.72, 0.83] | **0.345** [0.28, 0.41] | **0.325** [0.26, 0.39] |
 | | push | 0.605 [0.54, 0.67] | 0.265 [0.21, 0.33] | 0.300 [0.24, 0.37] |
-| BC + RL (mean ± std over TBD seeds) | all | TBD | TBD | TBD |
+| BC + GRPO, discrete head (`rl2_s{0,1,2}`, mean over 3 seeds, greedy) | reach | 0.878 | 0.442 | 0.445 |
+| | lift | 0.737 | 0.307 | 0.292 |
+| | push | 0.527 | 0.260 | 0.265 |
+| BC + Flow-GRPO, flow head (`rlf_s{0,1,2}`, mean over 3 seeds) | reach | 0.970 | 0.513 | 0.528 |
+| | lift | **0.902** | **0.388** | **0.377** |
+| | push | 0.627 | 0.253 | 0.222 |
 
 What the table shows:
 * Grounding lifts reach and lift success 3 to 6x on every split, for both heads.
@@ -283,6 +300,67 @@ End-effector jerk (RMS, lower is smoother):
 * Safety-violation counts and success relative to the ceiling are added when the result JSONs are regenerated.
 
 Randomization ablations (short schedule, one seed, labelled as such) and the data-scaling points: TBD.
+
+### RL post-training
+
+Short version: on the discrete head, RL post-training gives a small success gain on the trained tasks (about +0.03 at
+sampling temperature 1) and smoother motion (end-effector jerk 0.72 to 0.93x of BC). Most of its larger greedy-decoding
+gain comes from sharpening the action distribution, not from a better policy. On the flow head, Flow-GRPO lifts train
+lift success from 0.79 to 0.90 on all three seeds. Held-out generalisation barely moves for either head. The steps below
+are in the order they happened, including the parts that did not work.
+
+All RL runs train on `lift` and `push` (train split), 64 episodes per iteration (8 seeds x group of 8), one learner GPU and
+one rollout GPU, staleness 1, KL to the BC policy. Evaluations use 200 fixed-seed episodes per task and split.
+
+**1. Round 1 drifted.** The first recipe (`configs/rl.yaml`, 100 iterations, 3 seeds) took about 38 Adam steps per
+batch with a token-mean loss. KL to the BC policy reached about 1.9, in-training sampled success fell from 0.67 to
+0.31-0.38, and end-effector jerk doubled. Greedy train success rose on reach and lift but held-out push fell from 0.205
+to 0.12-0.18. Paired against a no-learning control (step 4) the round-1 policy is 0.14 worse.
+
+**2. Diagnosis and pilot ladder** (`docs/PLAN_v2_rl.md`). Two causes: the token-mean loss weights long (failed) episodes
+more, and too many optimiser steps per batch turn noise into a random walk. Three 35-iteration pilots on the same env
+seeds: (A) 4 optimiser steps per iteration, (B) plus per-episode loss normalisation and an advantage std floor, (C) plus
+an adaptive KL coefficient targeting 0.05 nats per token. All three kept KL at 0.015-0.05 (round 1: 0.57 at the same
+point). C was chosen and run for 80 iterations on 3 seeds plus a no-smoothness-penalty ablation.
+
+**3. Greedy evaluation looked like a clear win.** Mean over 3 seeds minus BC, greedy decoding:
+
+| Split | reach | lift | push | EE jerk vs BC |
+|---|---|---|---|---|
+| train | +0.023 | **+0.127** | +0.067 | 0.74-0.92x |
+| held-out | -0.008 | +0.017 | +0.055 | 0.77-0.92x |
+| held-out photo | +0.035 | +0.007 | +0.020 | 0.72-0.93x |
+
+**4. Two checks shrank it.**
+
+* *Sampled evaluation.* With actions sampled at temperature 1 (`rollout_eval --temperature 1.0`, same episodes), the BC
+  policy is already much better than its own greedy decoding (train reach 0.94 vs 0.855, lift 0.80 vs 0.61), and the RL
+  policies match it: mean minus BC is -0.052 to +0.017 in every cell. RL mostly moved the greedy policy toward what the
+  sampled policy already did. The jerk reduction survives sampling (train push 10.5 to 8.4-9.1).
+* *A seed confound in the training curve.* The in-training metric used to accept the recipe compared late iterations
+  with early ones. Rollout env seeds depend only on the iteration index, so that compares different, easier or harder,
+  scenes. A control run with the learning rate set to zero, on the identical seed schedule, shows the same "improvement"
+  (+0.026 discrete, +0.079 flow) with no learning at all. Paired against that control at each iteration (iterations
+  40-79), the gain is:
+
+| Run | Paired success gain at T=1 (± 1 s.e.) |
+|---|---|
+| Round 1, seed 0 | -0.143 ± 0.020 |
+| Pilot C (35 iterations; iterations 17-34) | +0.030 ± 0.016 |
+| Final, seeds 0 / 1 / 2 | +0.028 ± 0.012 / +0.022 ± 0.017 / +0.040 ± 0.014 |
+| Final without jerk penalties | +0.016 ± 0.016 (and higher held-out jerk: 14 vs 12) |
+| Flow-GRPO, seeds 0 / 1 / 2 | +0.027 ± 0.008 / +0.033 ± 0.010 / +0.016 ± 0.012 |
+
+The plan gated Flow-GRPO on a +0.05 gain. The confounded metric read +0.083 and the flow runs went ahead; the corrected
+gain is about +0.03, so by the plan's rule they would not have run. They are reported as exploratory.
+
+**5. Flow-GRPO.** The flow head (`bc_gflow6`) is fine-tuned with SDE rollouts (Euler-Maruyama, sigma_t = 0.7 sqrt(t/(1-t)),
+5 steps), per-step Gaussian log-probabilities and a closed-form KL; only the DiT head trains. Evaluation uses the
+10-step ODE with sampled initial noise. Against BC re-evaluated through the identical command
+(`results/eval_bc_gflow6_rlpipe.json`), mean over 3 seeds minus BC: train lift +0.107 (0.795 to 0.895-0.910 on every
+seed), train push +0.032, held-out lift +0.078, held-out photo lift +0.032, reach -0.005 to -0.037, held-out push -0.027
+and +0.012. Two BC evaluations of the same flow checkpoint differ by up to 0.09 in a single cell (held-out photo push
+0.30 vs 0.21), so only the train-lift gain is clearly outside evaluation noise.
 
 ### Distributed training
 
@@ -298,10 +376,15 @@ Randomization ablations (short schedule, one seed, labelled as such) and the dat
 
 | Measurement | Value |
 |---|---|
-| env-steps/s, S=0 vs S=1, per topology | TBD |
-| Weight-sync latency | TBD |
-| Mean `engine_mismatch`, importance-weight clip fraction | TBD |
-| Return, success and KL curves | TBD |
+| env-steps/s, S=0 vs S=1, per topology | S=1, 1+1 GPUs: median 460-500 env-steps/s (discrete, uncontended pair), 650-980 (flow); S=0 study TBD |
+| Weight-sync latency (learner to rollout, NCCL broadcast) | median 25-39 ms (full model), 5-9 ms (flow, DiT only); 5.8 s on a contended GPU pair |
+| Median `engine_mismatch` (rollout vs learner log-prob, same weights) | 0.011 discrete (static-cache engine), 0.032 flow; truncated-IS clip fraction 0.0 |
+| Return, success and KL curves | `$VLA_RUNS/<run>/metrics.jsonl` and TensorBoard; KL at iteration 80: 0.034-0.065 |
+
+The CUDA-graph decode engine first produced the wrong tokens (33% agreement with eager, RL `engine_mismatch` 1.12).
+Cause: `transformers` 5.22's `StaticLayer.update` ignores `cache_position` and advances its own write counter, so the
+three graph warm-up steps shifted every later KV write by three slots. The fix saves and restores those counters around
+capture; after it, token agreement is 1.0. The RL runs above use the static-cache engine, which is bit-exact with eager.
 
 ### Inference latency (p50 ms per query of one 4-step chunk)
 
@@ -340,17 +423,22 @@ Done:
 * Evaluation and the grounding probe.
 * Grounded discrete BC model.
 * Grounded flow BC model (warm-started from the grounded discrete backbone).
-* The RL, inference and benchmark code paths exist and are covered by CPU tests (295 passing). Their GPU results are not
-  measured yet.
+* RL post-training: round 1 (drifted, kept as the negative baseline), recipe pilots, final discrete GRPO on 3 seeds plus
+  a no-penalty ablation, learning-rate-zero controls, sampled evaluation, and exploratory Flow-GRPO on 3 seeds.
+* The inference and benchmark code paths exist and are covered by CPU tests (331 passing, 4 GPU-only skipped). Their GPU results are
+  not measured yet.
 
 Fixed along the way:
 * An rsync `--delete` removed the first set of result JSONs on the server. They were regenerated from the same
   checkpoints, and `sync.sh` now protects `results/`.
+* The CUDA-graph decode engine wrote KV entries three slots off after warm-up (see "Decoupled RL"); fixed and GPU-verified.
+* The first RL recipe drifted, and the metric used to accept the second was confounded by the rollout seed schedule;
+  both are documented under "RL post-training" with the corrected, paired numbers.
 
 Next:
 * Checkpoint-stall study, memory table and scaling sweep.
 * Randomization ablations on the grounded recipe.
-* RL post-training (3 seeds plus a penalty ablation).
+* RL throughput study (S=0 vs S=1, CUDA-graph engine).
 * Latency benchmark.
 * Demo videos.
 
@@ -362,8 +450,12 @@ Next:
   is bounded by that ceiling; success relative to the ceiling is reported next to it.
 * Only the 0.5B backbone is trained end to end. FSDP2 memory savings at larger scale are not demonstrated unless a
   1.5B measurement appears in the memory table.
-* RL results are from a small number of seeds on one task family; confidence intervals are Wilson intervals over
-  episodes within a seed, not across seeds.
+* RL results are from 3 seeds on two trained tasks (`lift`, `push`). The seeds vary action sampling and minibatch
+  order only: all runs share the same rollout env-seed schedule, which is also why late-vs-early training curves are
+  confounded and are reported paired against a learning-rate-zero control. Confidence intervals are Wilson intervals
+  over episodes within a seed, not across seeds.
+* The RL recipe was chosen with a metric later found to be confounded (see "RL post-training"); the Flow-GRPO runs it
+  unlocked are exploratory.
 * The CUDA-graph decode path depends on the installed `transformers` version; the engine falls back to the static-cache
   eager path and reports the reason if graph capture fails.
 * The grounding fix was found and tuned on the `train` split's validation episodes. The held-out splits were only

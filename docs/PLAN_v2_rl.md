@@ -45,3 +45,15 @@ Negative result with evidence: BC vs RL table (greedy and T=1, 3 seeds), KL/entr
 length-bias analysis (neg_weight_frac vs drift). Report the reach gain as observed, not caused (reach not trained).
 Resume: claim the async RL infra, throughput and the diagnosis, not a success gain.
 P6b Flow-GRPO runs only if final shows dT1 >= +0.05 averaged over 3 seeds with bounded KL; else "not run (gate failed)".
+
+## Addendum (lead, 2026-11-08): the dT1 metric was confounded
+
+`dT1` compared in-training success at iterations 70-79 with iterations 0-5 of the same run. Rollout env seeds are
+`seed0 + k*8 + j` for iteration k, identical in every run, so the two windows contain different scenes. A control run
+with `lr=0.0` on the same schedule shows a naive dT1 of +0.026 (discrete) and +0.079 (flow) with no learning.
+
+Corrected metric: per-iteration success minus the `lr=0` control at the same iteration, averaged over iterations 40-79.
+Final discrete seeds: +0.028 / +0.022 / +0.040 (mean +0.030); the P6b gate (+0.05) is not met on the corrected metric.
+Flow-GRPO had already run on the confounded reading (+0.083) and is reported as exploratory.
+Sampled (T=1) evaluation on 200 fixed episodes agrees: RL minus BC is -0.052 to +0.017 per cell, within noise.
+Future gates should use the paired control (or fixed-seed T=1 evaluation), never a within-run late-vs-early window.
