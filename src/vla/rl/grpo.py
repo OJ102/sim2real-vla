@@ -18,7 +18,7 @@ import torch
 import torch.distributed as dist
 
 from vla.model.vla import VLA, VLAConfig
-from vla.rl.learner import learner_loop
+from vla.rl.learner import learner_loop, prune_iter_ckpts
 from vla.rl.rollout_worker import rollout_loop
 from vla.rl.roles import init_sync_group, make_roles
 from vla.sim.rewards import DEFAULT_WEIGHTS
@@ -149,6 +149,8 @@ def main():
         model.train()
         res = learner_loop(cfg, roles, rank, device, model, ref, learner_pg, sync_pg, shm, logger, log)
         export_final(model, run / "final.pt", group=learner_pg)
+        if rank == roles.learner_ranks[0]:  # final.pt supersedes the last mid-run checkpoint
+            prune_iter_ckpts(shm)
         logger.close()
         if rank == roles.learner_ranks[0]:
             log(f"[learner] done: {cfg.iterations} iterations, {res['tokens']/res['secs']:.0f} tokens/s overall")

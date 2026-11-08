@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import copy
 import json
+import re
 import time
 from pathlib import Path
 
@@ -68,6 +69,25 @@ def load_batches(paths: list[Path], G: int, adv_std_floor: float = 0.0):
     if "x_next" in out:
         out["t"], out["std"] = extra_t
     return out, ep_stats, metas
+
+
+def iter_ckpt_path(shm: Path, n: int) -> Path:
+    """Mid-run checkpoint of iteration n, written next to the run's shm dir (`<shm_dir>/<name>_iter<n>.pt`)."""
+    return shm.parent / f"{shm.name}_iter{n}.pt"
+
+
+def prune_iter_ckpts(shm: Path, keep: Path | None = None) -> list[Path]:
+    """Delete this run's mid-run checkpoints except `keep`. Exact-name match (`<name>_iter<digits>.pt`), so another run
+    whose name merely starts with this one (e.g. `foo_iter5` vs `foo`) is never touched. Call only on the writing rank."""
+    pat = re.compile(re.escape(shm.name) + r"_iter\d+\.pt")
+    removed = []
+    if not shm.parent.is_dir():
+        return removed
+    for p in shm.parent.iterdir():
+        if pat.fullmatch(p.name) and p != keep:
+            p.unlink(missing_ok=True)
+            removed.append(p)
+    return removed
 
 
 def learner_loop(cfg, roles, rank, device, model, ref, learner_pg, sync_pg, shm: Path, logger, log=print):
@@ -219,5 +239,8 @@ def learner_loop(cfg, roles, rank, device, model, ref, learner_pg, sync_pg, shm:
             if lr_i == 0:
                 p.unlink(missing_ok=True)
         if cfg.ckpt_every and (j + 1) % cfg.ckpt_every == 0 and j + 1 < K:
-            export_final(model, shm.parent / f"{shm.name}_iter{j+1}.pt", group=learner_pg)
+            ck = iter_ckpt_path(shm, j + 1)
+            export_final(model, ck, group=learner_pg)  # atomic; raises on every learner rank if the write failed
+            if rank == roles.learner_ranks[0]:  # the rank that wrote it: keep only the newest (/dev/shm filled up)
+                prune_iter_ckpts(shm, keep=ck)
     return {"tokens": tot_tokens, "secs": time.perf_counter() - t_run}

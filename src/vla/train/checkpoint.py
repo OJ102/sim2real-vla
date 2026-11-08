@@ -163,14 +163,26 @@ class Checkpointer:
 
 
 def export_final(model, path: str | os.PathLike, dtype=torch.bfloat16, group=None) -> None:
-    """Model weights only (no optimizer): full state dict gathered to rank 0 and saved as one .pt file."""
+    """Model weights only (no optimizer): full state dict gathered to rank 0 and saved as one .pt file.
+    Atomic: written to a hidden tmp file in the same directory, fsynced, then os.replace'd onto `path`, so a crash or
+    ENOSPC mid-write never leaves a truncated `path` (an existing `path` stays intact until the new one is complete)."""
     sd, _ = get_state_dict(model, [], options=StateDictOptions(full_state_dict=True, cpu_offload=True))
     err = None
     if not dist.is_initialized() or dist.get_rank(group) == 0:
+        path = Path(path)
+        tmp = path.with_name(f".{path.name}.tmp{os.getpid()}")
         try:
-            torch.save({k: (v.to(dtype) if v.is_floating_point() else v) for k, v in sd.items()}, path)
+            with open(tmp, "wb") as f:
+                torch.save({k: (v.to(dtype) if v.is_floating_point() else v) for k, v in sd.items()}, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
         except (OSError, RuntimeError) as e:  # torch.save raises RuntimeError (PyTorchStreamWriter) for open/ENOSPC; tell every rank so they all raise together instead of hanging
             err = repr(e)
+            try:
+                tmp.unlink(missing_ok=True)  # don't leave a partial tmp file eating the disk
+            except OSError:
+                pass
     if dist.is_initialized():
         objs = [err]
         dist.broadcast_object_list(objs, src=dist.get_global_rank(group, 0) if group is not None else 0, group=group)
