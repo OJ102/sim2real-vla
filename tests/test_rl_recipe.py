@@ -265,11 +265,12 @@ def test_defaults_are_deterministic_and_token_norm(tmp_path):
     a, b = grpo(tmp_path, "d1"), grpo(tmp_path, "d2")
     # rollouts are bitwise reproducible; learner-side floats drift ~2e-6 rel from multi-process CPU reduction order
     # (bitwise run-to-run determinism of training is not a requirement)
-    # measured over 4x2 runs: loss max abs 1.5e-9 (|loss|~1e-4 is a cancellation of O(1) terms, so noise is absolute,
-    # ~1.2e-5 rel), grad_norm 1.2e-8 rel, tis_w_mean 3e-9 rel, engine_mismatch 3e-10 abs; kl/clipfrac/return exact
-    exact = ("kl", "ratio_clipfrac", "return_mean")
-    close = {"loss": dict(rel=1e-5, abs=1e-8), "grad_norm": dict(rel=1e-5), "tis_w_mean": dict(rel=1e-6),
-             "engine_mismatch": dict(rel=1e-5, abs=1e-7)}
+    # measured over 12x2 runs + suite runs: loss max abs 4.6e-9 (|loss|~1e-4 is a cancellation of O(1) terms, so noise
+    # is absolute, up to 5e-5 rel), kl 3.7e-11 abs / 7.5e-5 rel (|kl|~5e-7, learner-side like loss), grad_norm 2.2e-8 rel,
+    # tis_w_mean 7e-9 rel, engine_mismatch 2e-9 abs; ratio_clipfrac / return_mean always exact (rollout side / counts)
+    exact = ("ratio_clipfrac", "return_mean")
+    close = {"loss": dict(rel=1e-5, abs=5e-8), "kl": dict(rel=1e-3, abs=1e-9), "grad_norm": dict(rel=1e-5),
+             "tis_w_mean": dict(rel=1e-6), "engine_mismatch": dict(rel=1e-5, abs=1e-7)}
     for x, y in zip(a, b):
         assert all(x[k] == y[k] for k in exact), [(k, x[k], y[k]) for k in exact if x[k] != y[k]]
         for k, tol in close.items():
