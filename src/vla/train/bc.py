@@ -207,19 +207,6 @@ def main():
                             weight_decay=cfg.weight_decay, betas=(0.9, 0.95),
                             fused=bool(cuda and cfg.fused_adam))
 
-    engine = None
-    if cfg.backend == "deepspeed":
-        import deepspeed
-
-        assert cfg.global_batch % (cfg.micro_batch * world) == 0
-        ds_cfg = {"train_micro_batch_size_per_gpu": cfg.micro_batch,
-                  "gradient_accumulation_steps": cfg.global_batch // (cfg.micro_batch * world),
-                  "bf16": {"enabled": cfg.bf16}, "gradient_clipping": cfg.grad_clip,
-                  "zero_optimization": {"stage": 3, "overlap_comm": True, "contiguous_gradients": True},
-                  "zero_allow_untested_optimizer": True, "steps_per_print": 10**9}
-        engine, opt, _, _ = deepspeed.initialize(model=model, optimizer=opt, config=ds_cfg)
-        model = engine
-        base = engine.module
     ds = VLADataset(data_dir, chunk=mcfg.chunk, part="train", subset=cfg.subset or None,
                     swap_p=cfg.ground_swap_p if cfg.ground_weight > 0 else 0.0, seed=cfg.seed)
     val_ds = VLADataset(data_dir, chunk=mcfg.chunk, part="val")  # never swapped: val_main_loss stays comparable
@@ -233,7 +220,22 @@ def main():
     sampler = ResumableDistributedSampler(len(ds), rank, world, seed=cfg.seed, repeats=repeats)
     steps_per_epoch = sampler.num_per_rank // per_rank_step
     total = cfg.steps or int(cfg.epochs * steps_per_epoch)
-    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: lr_at(s, total, cfg.warmup))
+    # built on the raw torch optimizer, BEFORE deepspeed.initialize: ZeRO-3's DeepSpeedZeroOptimizer_Stage3 is not a
+    # torch Optimizer (LambdaLR raises TypeError on it). fsdp/ddp set the lr manually each step (sched only carries
+    # state for ckpts); deepspeed gets it as lr_scheduler= and its engine steps it at every optimizer step.
+    torch_opt = opt
+    sched = torch.optim.lr_scheduler.LambdaLR(torch_opt, lambda s: lr_at(s, total, cfg.warmup))
+    engine = None
+    if cfg.backend == "deepspeed":
+        import deepspeed
+
+        ds_cfg = {"train_micro_batch_size_per_gpu": cfg.micro_batch, "gradient_accumulation_steps": accum,
+                  "bf16": {"enabled": cfg.bf16}, "gradient_clipping": cfg.grad_clip,
+                  "zero_optimization": {"stage": 3, "overlap_comm": True, "contiguous_gradients": True},
+                  "zero_allow_untested_optimizer": True, "steps_per_print": 10**9}
+        engine, opt, _, _ = deepspeed.initialize(model=model, optimizer=torch_opt, config=ds_cfg, lr_scheduler=sched)
+        model = engine
+        base = engine.module
     # checkpoints (8 GB each) go to $VLA_CKPT/<name> (RAM-backed on the server) when set; only final.pt/metrics on home
     ckpt_dir = resolve_ckpt_dir(cfg, run)
     art_dir = Path(ckpt_dir).parent  # best.pt / stop_<step>.pt live here (RAM-backed $VLA_CKPT/<name> on the server)
@@ -261,7 +263,9 @@ def main():
               flush=True)
 
     step, epoch, in_epoch, best_val = 0, 0, 0, float("inf")
-    if a.resume:
+    if a.resume and engine is not None:
+        say("!!! --resume ignored: backend=deepspeed writes no checkpoints (throughput sweeps only)")
+    elif a.resume:
         ex = ckpt.load_latest(model, opt, {"step": 0, "epoch": 0, "in_epoch": 0, "sched": sched.state_dict(),
                                            "best_val": float("inf")})
         if ex is not None:
@@ -421,7 +425,8 @@ def main():
                 else:
                     mems = [mem]
                 rec = {"loss": m[0].item(), "tok_acc": m[1].item(), "main_loss": m[2].item(), "grad_norm": float(gn), "step_time": dt,
-                       "samples_per_s": cfg.global_batch / dt, "lr": opt.param_groups[0]["lr"], "epoch": epoch,
+                       "samples_per_s": cfg.global_batch / dt, "lr": (torch_opt.param_groups[0]["lr"] if engine is None  # deepspeed already stepped sched: log the lr it used
+                              else cfg.lr * lr_at(step - 1, total, cfg.warmup)), "epoch": epoch,
                        "mfu": flops_s * cfg.global_batch / dt / (world * cfg.peak_tflops * 1e12),
                        "mem_alloc_gb_per_rank": [x.item() for x in mems], "ckpt_stall_s": stall,
                        "data_wait_s": data_wait, "compute_s": dt - data_wait, **host_mem()}
