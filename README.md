@@ -364,13 +364,83 @@ and +0.012. Two BC evaluations of the same flow checkpoint differ by up to 0.09 
 
 ### Distributed training
 
+All on one node, 0.5B model (582M parameters), real demonstration data, `configs/bc.yaml`, global batch 256 unless
+stated. GPUs 0 and 1 were shared with other users' inference servers, so many rows carry the `contended` flag
+(see "Measurement protocol").
+
 | Measurement | Value |
 |---|---|
-| Step throughput, baseline vs tuned configuration (samples/s, MFU) | TBD |
-| 1 / 2 / 4 GPU scaling efficiency, FSDP2 vs ZeRO-3, with and without activation checkpointing | TBD |
-| Per-GPU peak memory, FSDP2 vs DDP | TBD |
-| Async vs sync checkpoint stall, `/dev/shm` vs NFS | TBD |
-| Kill-and-resume loss difference | TBD |
+| Step throughput, baseline vs tuned (4 GPUs, FSDP2) | 594 samples/s, MFU 37.5% to 866 samples/s, MFU 54.7% (1.46x) |
+| 1 / 2 / 4 GPU scaling efficiency (FSDP2) | 1.00 / 0.95 / 0.94 without activation checkpointing, 1.00 / 0.95 / 0.93 with it |
+| 1 / 2 / 4 GPU scaling efficiency (DDP) | 1.00 / 0.96 / 0.93 for both settings |
+| ZeRO-3 (DeepSpeed) | not measured: the backend failed at startup in this sweep (see below) |
+| Per-GPU peak memory at 4 GPUs, FSDP2 vs DDP | 12.5 vs 25.8 GB; with activation checkpointing 4.4 vs 13.6 GB |
+| Checkpoint stall per save, sync vs async (`/dev/shm`, 7.0 GB) | 4.97 s vs 0.99 s median over 5 saves (async/sync 0.20) |
+| Kill-and-resume loss difference (4 GPUs, steps 41-60 after resume) | max 3.2e-4 sync, 6.4e-4 async; noise floor before the kill 1.9e-4 / 5.5e-4 |
+
+Step throughput ladder (`results/bench_bc_step.json`, 4 GPUs, FSDP2, 20 timed steps per row, each row adds to the one above):
+
+| Configuration | samples/s | MFU | Peak memory per GPU | Contended |
+|---|---|---|---|---|
+| Baseline: reshard after forward, no prefetch, micro-batch 32 x 2 accumulation, eager, fused AdamW | 594 | 37.5% | 13.8 GB | no |
+| + `reshard_after_forward=False` | 613 | 38.7% | 14.5 GB | no |
+| + explicit forward/backward prefetch | 612 | 38.6% | 14.5 GB | no |
+| + micro-batch 64, no accumulation | 684 | 43.2% | 25.0 GB | yes |
+| + `torch.compile` per transformer block | **866** | **54.7%** | 19.6 GB | yes |
+| Ablation: micro-batch 64 row with fused AdamW off | 517 | 32.7% | 25.0 GB | yes |
+
+The two largest gains are fewer, larger micro-batches (+12%) and per-block compilation (+27%). The last two rows ran
+while other users' jobs were on GPUs 0 and 1, so their gains are lower bounds rather than inflated. Not resharding after
+forward costs 0.8 GB per GPU for +3%. Explicit prefetch gave nothing on top of it: profiler traces of both settings
+(`results/traces/fsdp2_4gpu_prefetch{0,1}.json.gz`) are for viewing in Perfetto. The unfused AdamW costs 24%.
+
+Scaling sweep (`results/scaling.json`, 120 steps, median of 2 repeats; the repeats agree within 1%):
+
+| Backend | GPUs | Act. ckpt | samples/s | MFU | Efficiency | Peak memory per GPU |
+|---|---|---|---|---|---|---|
+| FSDP2 | 1 / 2 / 4 | off | 193 / 367 / 723 | 49.7 / 47.2 / 46.5% | 1.00 / 0.95 / 0.94 | 19.0 / 14.7 / 12.5 GB |
+| FSDP2 | 1 / 2 / 4 | on | 149 / 283 / 554 | 38.5 / 36.4 / 35.6% | 1.00 / 0.95 / 0.93 | 10.9 / 6.5 / 4.4 GB |
+| DDP | 1 / 2 / 4 | off | 139 / 269 / 516 | 35.9 / 34.6 / 33.2% | 1.00 / 0.96 / 0.93 | 25.8 at every size |
+| DDP | 1 / 2 / 4 | on | 110 / 213 / 409 | 28.3 / 27.3 / 26.3% | 1.00 / 0.97 / 0.93 | 13.6 at every size |
+
+What it shows:
+* FSDP2 memory falls with world size as parameters, gradients and optimizer state are sharded. DDP memory stays the
+  same at every size. At 4 GPUs FSDP2 needs half of DDP's memory, and with activation checkpointing a third.
+* Both backends keep 93-96% scaling efficiency up to 4 GPUs. A 0.5B model on NVLink A100s is far from
+  communication-bound, so this does not tell us how they would scale across nodes.
+* FSDP2 is also faster than DDP on a single GPU, but the comparison is not like for like. The FSDP2 path keeps bf16
+  parameters (`MixedPrecisionPolicy`), while DDP keeps fp32 parameters under bf16 autocast and pays for the casts.
+* Activation checkpointing costs 21-23% throughput and cuts peak memory 43-65%.
+* The ZeRO-3 rows are missing because of a bug. On DeepSpeed 0.19.9, `torch.optim.lr_scheduler.LambdaLR` rejects the
+  wrapped `DeepSpeedZeroOptimizer_Stage3`, so all 12 runs exited at startup. The fix is pending, and these rows will
+  be filled after it.
+
+Checkpointing (`results/ckpt_stall.json`, 4 GPUs, 7.0 GB DCP checkpoint including optimizer state):
+* On `/dev/shm`, a synchronous save stalls training 4.97 s, against a 0.19 s step. An asynchronous save stalls it
+  0.99 s (staging to pinned host memory), which meets the bar of under 20% of sync.
+  * The write itself overlaps training. Steps take 0.28 s instead of 0.19 s while it runs, and the checkpoint is
+    published in 6.5 s.
+* NFS (`/home2`) is not measured. The NFS saves failed after about 69 s in both modes, and the logged error was too
+  truncated to show why. Plain writes to the same directory run at 106 MB/s, so a 7 GB checkpoint should take
+  about 66 s. Fuller error logging is pending.
+
+Kill-and-resume (`results/resume_gpu.json`): 4 GPUs, 60 steps, checkpoint every 20 steps.
+* The killed run hard-exits after step 47, like `kill -9`, with no save or flush. It is then resumed with `--resume`.
+  Its losses are compared with an uninterrupted reference run.
+* **Sync:** resumes from step 40. The replayed steps 41-47 have bit-identical losses to the first time through. After
+  resume the losses differ from the reference by at most 3.2e-4 (relative 7.9e-5). That is about the 1.9e-4 gap the
+  two runs already had before the kill, from nondeterministic GPU kernels.
+* **Async:** resumes from step 20, not 40, by design.
+  * The step-40 save takes about 6.5 s to publish, but the process died 7 steps (about 2.5 s) after the save started.
+    The incomplete step-40 directory was never pointed to by `latest`.
+  * So the run fell back to the last complete checkpoint. It lost 27 steps of work, but its state was not
+    corrupted. The loss difference after resume is at most 6.4e-4, against a 5.5e-4 noise floor.
+
+Two operational failures from this study are also recorded:
+* The first resume run was invalid. Leftover checkpoints from the scaling sweep had filled `/dev/shm`, so every save
+  failed. The training loop logs and continues past a failed save, and the "resumed" run had retrained from scratch.
+  The test script now checks free space, fails on any failed save, and checks that `resume_from` matches.
+* After a failed async save, one run deadlocked a few steps later (all ranks at 0% GPU for 3 hours). That fix is pending.
 
 ### Decoupled RL
 
@@ -452,6 +522,8 @@ Done:
 * RL post-training: round 1 (drifted, kept as the negative baseline), recipe pilots, final discrete GRPO on 3 seeds plus
   a no-penalty ablation, learning-rate-zero controls, sampled evaluation, and exploratory Flow-GRPO on 3 seeds.
 * Decoupled-RL throughput study: S=0 vs S=1 on 1+1, 2+2 and 1+3 GPU topologies, CUDA-graph vs static engine.
+* Training-system study: step-throughput ladder, FSDP2 and DDP scaling and memory on 1/2/4 GPUs, sync vs async
+  checkpoint stall on `/dev/shm`, and a GPU kill-and-resume check for both checkpoint modes.
 * The inference and benchmark code paths exist and are covered by CPU tests (331 passing, 4 GPU-only skipped). Their GPU results are
   not measured yet.
 
@@ -463,7 +535,8 @@ Fixed along the way:
   both are documented under "RL post-training" with the corrected, paired numbers.
 
 Next:
-* Checkpoint-stall study, memory table and scaling sweep.
+* Fix the DeepSpeed scheduler bug, the async-save deadlock and the truncated checkpoint error. Then measure the ZeRO-3
+  rows and the NFS checkpoint stall.
 * Randomization ablations on the grounded recipe.
 * Latency benchmark.
 * Demo videos.
