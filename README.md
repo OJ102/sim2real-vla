@@ -376,10 +376,36 @@ and +0.012. Two BC evaluations of the same flow checkpoint differ by up to 0.09 
 
 | Measurement | Value |
 |---|---|
-| env-steps/s, S=0 vs S=1, per topology | S=1, 1+1 GPUs: median 460-500 env-steps/s (discrete, uncontended pair), 650-980 (flow); S=0 study TBD |
+| Rollout-side env-steps/s while generating (1+1, discrete) | 610 CUDA-graph engine vs 318 static-cache engine (1.9x) |
 | Weight-sync latency (learner to rollout, NCCL broadcast) | median 25-39 ms (full model), 5-9 ms (flow, DiT only); 5.8 s on a contended GPU pair |
 | Median `engine_mismatch` (rollout vs learner log-prob, same weights) | 0.011 discrete (static-cache engine), 0.032 flow; truncated-IS clip fraction 0.0 |
 | Return, success and KL curves | `$VLA_RUNS/<run>/metrics.jsonl` and TensorBoard; KL at iteration 80: 0.034-0.065 |
+
+Throughput study (`results/rl_throughput.json`): 20 iterations per configuration, medians over iterations 3-19,
+64 episodes per rollout GPU per iteration, discrete head. S is the staleness bound: S=0 alternates rollout and learning,
+S=1 lets the rollout GPU generate batch k+1 with weights k while the learner trains on batch k.
+The 1+1 runs used the two quiet GPUs and were interleaved S=0/S=1 twice (the repeats agree within 2%); the 2+2 and
+1+3 runs also used two GPUs that other users were loading at up to 78-93% and are marked contended.
+
+| Topology (learner + rollout GPUs) | Engine | S=0 episodes/s | S=1 episodes/s | S=1 / S=0 | Learner idle at S=0 |
+|---|---|---|---|---|---|
+| 1+1 | CUDA graph | 3.22 | 4.71 | **1.46x** | 0.33 |
+| 1+1 | static cache | 2.15 | 4.68 | 2.18x | 0.41 |
+| 2+2 (contended) | CUDA graph | 5.24 | 6.47 | 1.23x | 0.28 |
+| 1+3 (contended) | CUDA graph | 4.30 | 4.44 | 1.03x | 0.17 |
+
+What it shows:
+* Overlap pays off exactly where generation and learning take comparable time. At 1+1 with CUDA graphs, S=1 removes
+  the learner's idle third and gives 1.46x (the plan's bar was 1.3x). With the slower static engine there is more idle
+  time to hide, so the gain is 2.18x, and S=1 makes the two engines equally fast because the learner is now the
+  bottleneck (rollout idle 1.4 s per iteration with the static engine, 7.4 s with graphs).
+* 1+3 is learner-bound: one learner GPU has to train on 192 episodes per iteration, the three rollout GPUs sit idle
+  about 35 s of each 44 s iteration, and overlap has nothing to hide (1.03x). Adding rollout GPUs only helps with more
+  learner GPUs.
+* 2+2 scales episodes/s 1.4x over 1+1 at S=1, below linear; its weight sync took 187 ms against 23 ms at 1+1, which
+  points at the contended GPUs, but this run cannot separate that from the extra broadcast hop.
+* `engine_mismatch` rises from 0.009 at S=0 to 0.011 at S=1: one policy version of staleness, corrected by truncated
+  importance sampling (clip fraction 0).
 
 The CUDA-graph decode engine first produced the wrong tokens (33% agreement with eager, RL `engine_mismatch` 1.12).
 Cause: `transformers` 5.22's `StaticLayer.update` ignores `cache_position` and advances its own write counter, so the
@@ -425,6 +451,7 @@ Done:
 * Grounded flow BC model (warm-started from the grounded discrete backbone).
 * RL post-training: round 1 (drifted, kept as the negative baseline), recipe pilots, final discrete GRPO on 3 seeds plus
   a no-penalty ablation, learning-rate-zero controls, sampled evaluation, and exploratory Flow-GRPO on 3 seeds.
+* Decoupled-RL throughput study: S=0 vs S=1 on 1+1, 2+2 and 1+3 GPU topologies, CUDA-graph vs static engine.
 * The inference and benchmark code paths exist and are covered by CPU tests (331 passing, 4 GPU-only skipped). Their GPU results are
   not measured yet.
 
@@ -438,7 +465,6 @@ Fixed along the way:
 Next:
 * Checkpoint-stall study, memory table and scaling sweep.
 * Randomization ablations on the grounded recipe.
-* RL throughput study (S=0 vs S=1, CUDA-graph engine).
 * Latency benchmark.
 * Demo videos.
 
