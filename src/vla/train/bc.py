@@ -354,7 +354,9 @@ def main():
         dl = DataLoader(ds, batch_size=cfg.micro_batch, sampler=sampler, collate_fn=collate,
                         num_workers=cfg.num_workers, drop_last=True, persistent_workers=False,
                         pin_memory=cuda and cfg.pin_memory,
-                        prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None)
+                        prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
+                        # a starved loader (e.g. workers stuck on a full /dev/shm) raises instead of hanging silently
+                        timeout=cfg.pg_timeout_min * 60 if cfg.num_workers > 0 else 0)
         it = iter(dl)
         while in_epoch < steps_per_epoch and step < total:
             t0 = time.perf_counter()

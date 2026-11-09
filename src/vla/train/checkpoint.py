@@ -83,7 +83,7 @@ class Checkpointer:
         self.log = log or (lambda m: print(m, flush=True))
         self.n_failed = 0
         shared_pg_bug = shared_pg_bug or os.environ.get("VLA_CKPT_SHARED_PG") == "1"  # repro of the old deadlock
-        td = timedelta(minutes=timeout_min)
+        td = self._td = timedelta(minutes=timeout_min)
         # `_pg` is used ONLY by DCP's background save thread. `_ctl` carries our own consensus/barrier collectives
         # from the main thread: sharing one gloo group between two threads interleaves collectives and deadlocks.
         self._pg = dist.new_group(backend="gloo", timeout=td) if (dist.is_initialized() and mode == "async") else None
@@ -112,8 +112,30 @@ class Checkpointer:
             self._failed(step, e)
             if self.mode == "sync":
                 self._publish_if_all_ok(step, False)
+        if self.mode == "async":
+            self._agree_launched(step)
         self.last_stall_s = time.perf_counter() - t0
         return self.last_stall_s
+
+    def _agree_launched(self, step: int) -> None:
+        """All ranks must agree that the async save is in flight everywhere. If the synchronous part of async_save
+        (state_dict / staging) failed on SOME ranks only, the others' DCP background threads wait in a collective the
+        failed ranks never join, and those ranks would then all-reduce on `_ctl` in poll() while the failed ones don't:
+        a collective mismatch. So: consensus now; on any failure every rank drops its future, and `_pg` is replaced
+        (the orphaned DCP thread times out on the old group and nobody waits on it). Nothing stays pending."""
+        ok = torch.tensor([int(self._pending is not None)])
+        if dist.is_initialized():
+            dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=self._ctl)
+        if ok.item():
+            return
+        if self._pending is not None:
+            self._pending = None
+            self._failed(step, RuntimeError("async save launched here but failed to launch on another rank; "
+                                            "abandoning this rank's in-flight copy"))
+        if dist.is_initialized():
+            self._pg = dist.new_group(backend="gloo", timeout=self._td)  # every rank reaches this line together
+        if self.rank == 0:
+            shutil.rmtree(self.dir / step_name(step), ignore_errors=True)
 
     def _failed(self, step: int, e: BaseException) -> None:
         self.n_failed += 1
