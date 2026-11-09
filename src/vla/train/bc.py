@@ -67,6 +67,7 @@ class BCConfig:
     ckpt_dir: str = ""                  # default <run>/ckpt
     peak_tflops: float = 312.0          # A100 bf16
     export_final: bool = True
+    save_final: bool = True             # end-of-run DCP save (false for throughput sweeps: 7 GB per run on /dev/shm)
     pg_timeout_min: float = 10.0        # explicit timeout on every process group (hangs raise instead of sitting)
     hang_dump_s: float = 0.0            # >0: dump all thread stacks to stdout if a step takes longer (also SIGUSR2)
     ckpt_slow_s: float = 0.0            # test aid: slow DCP writer (reproduces async-overlap bugs on CPU)
@@ -478,7 +479,7 @@ def main():
     ckpt.wait()
     if not stop:
         publish_best()
-        if step % cfg.ckpt_every != 0 and engine is None:
+        if cfg.save_final and step % cfg.ckpt_every != 0 and engine is None:
             ckpt.save(step, model, opt, extra())
             ckpt.wait()
         if cfg.export_final and engine is None:

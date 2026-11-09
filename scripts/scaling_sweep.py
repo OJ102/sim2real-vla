@@ -10,6 +10,7 @@ import argparse
 import itertools
 import json
 import os
+import shutil
 import statistics
 import subprocess
 import sys
@@ -17,6 +18,15 @@ import tempfile
 from pathlib import Path
 
 from vla.utils.gpu import quiet_wait, snapshot
+
+
+def rm_ckpt(name: str, runs_dir: str) -> None:
+    """Remove the run's checkpoint dirs (same locations as vla.train.bc.resolve_ckpt_dir); metrics.jsonl stays."""
+    dirs = [Path(runs_dir) / name / "ckpt"]
+    if os.environ.get("VLA_CKPT"):
+        dirs.append(Path(os.environ["VLA_CKPT"]) / name)
+    for d in dirs:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def run_one(cfg: dict, gpus: list[int], extra: list[str], port: int, runs_dir: str, data_dir: str, quiet: bool) -> dict:
@@ -31,8 +41,11 @@ def run_one(cfg: dict, gpus: list[int], extra: list[str], port: int, runs_dir: s
     cmd = ["torchrun", "--nnodes=1", f"--nproc_per_node={n}", "--rdzv_backend=c10d",
            f"--rdzv_endpoint=localhost:{port}", "-m", "vla.train.bc", "--config", "configs/bc.yaml", f"name={name}",
            f"runs_dir={runs_dir}", f"data_dir={data_dir}", f"backend={cfg['backend']}", f"act_ckpt={str(cfg['act_ckpt']).lower()}",
-           "steps=120", "log_every=1", "val_every=100000", "ckpt_every=100000", "export_final=false", *extra]
-    r = subprocess.run(cmd, env=env, capture_output=True, text=True)
+           "steps=120", "log_every=1", "val_every=100000", "ckpt_every=100000", "export_final=false", "save_final=false", *extra]
+    try:
+        r = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    finally:
+        rm_ckpt(name, runs_dir)  # never leave a run's checkpoint behind (24 x 7 GB filled /dev/shm)
     rec["returncode"] = r.returncode
     rec["gpu_snapshot_after"] = snapshot(gpus=gpus[:n])
     rec["contended"] = bool(rec["gpu_snapshot_before"].get("contended") or rec["gpu_snapshot_after"].get("contended")
