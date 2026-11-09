@@ -10,7 +10,9 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
+import traceback
 from datetime import timedelta
 from pathlib import Path
 
@@ -19,6 +21,30 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint.api import CheckpointException  # derives from BaseException, not Exception!
 from torch.distributed.checkpoint.state_dict import StateDictOptions, get_state_dict, set_state_dict
+
+
+def describe_ckpt_error(e: BaseException, max_msg: int = 4000) -> str:
+    """Root cause of a (DCP) checkpoint failure on one line. str(CheckpointException) starts with DCP's own collective
+    plumbing (utils.py all_reduce -> map_fun), which hid the real error behind a 300-char cut. This lists, per distinct
+    cause, the ranks that hit it, the exception type + full message (cause chain included) and the last frame."""
+    if isinstance(e, CheckpointException):
+        groups: dict[str, list] = {}
+        for r, f in sorted(e.failures.items()):
+            exc, trace = (f if (isinstance(f, tuple) and len(f) == 2 and isinstance(f[0], BaseException))
+                          else (f, None))
+            if not isinstance(exc, BaseException):
+                groups.setdefault(repr(exc)[:max_msg], []).append(r)
+                continue
+            last = trace[-1] if trace else (traceback.extract_tb(exc.__traceback__)[-1] if exc.__traceback__ else None)
+            where = f" @ {last.filename}:{last.lineno} in {last.name}" if last else ""
+            groups.setdefault(describe_ckpt_error(exc, max_msg) + where, []).append(r)
+        return "CheckpointException root cause(s): " + " | ".join(f"ranks {rs}: {msg}" for msg, rs in groups.items())
+    parts, seen, cur = [], set(), e
+    while cur is not None and id(cur) not in seen and len(parts) < 5:  # explicit cause chain (raise X from Y), or context
+        seen.add(id(cur))
+        parts.append(f"{type(cur).__name__}: {str(cur)[:max_msg]}")
+        cur = cur.__cause__ or (None if cur.__suppress_context__ else cur.__context__)
+    return " <- caused by ".join(parts)
 
 
 def step_name(step: int) -> str:
@@ -91,8 +117,11 @@ class Checkpointer:
 
     def _failed(self, step: int, e: BaseException) -> None:
         self.n_failed += 1
-        self.log(f"!!! CHECKPOINT SAVE FAILED at step {step}: {type(e).__name__}: {str(e)[:300]} "
-                 f"(continuing; `latest` unchanged)")
+        self.log(f"!!! CHECKPOINT SAVE FAILED at step {step}: {describe_ckpt_error(e)} (continuing; `latest` unchanged)")
+        # full detail, untruncated, on stderr (one copy per rank): local traceback + DCP's per-rank tracebacks
+        sys.stderr.write(f"[rank {self.rank}] checkpoint step {step} failure detail:\n"
+                         + "".join(traceback.format_exception(type(e), e, e.__traceback__)) + str(e) + "\n")
+        sys.stderr.flush()
 
     def _publish_if_all_ok(self, step: int, ok: bool) -> None:
         """All ranks agree (min over ok flags); only then publish `latest`. Otherwise clean the partial dir."""
