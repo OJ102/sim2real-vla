@@ -84,9 +84,10 @@ class BCConfig:
     exit_after_step: int = 0            # test aid: hard-exit (like kill -9, no save/flush) after this step
 
 
-def flops_per_sample(model, seq_len: int) -> float:
-    """Fwd+bwd FLOPs per sample: seq_len * (6*N + 12*L*d*S), L/d of the LM, N all params (PLAN v2 formula)."""
-    n = count_params(model)["total"]
+def flops_per_sample(model, seq_len: int, n_params: int | None = None) -> float:
+    """Fwd+bwd FLOPs per sample: seq_len * (6*N + 12*L*d*S), L/d of the LM, N all params (PLAN v2 formula).
+    n_params: pass the count taken before wrapping; ZeRO-3 partitions params, so numel() is ~0 outside a gather."""
+    n = count_params(model)["total"] if n_params is None else n_params
     c = model.llm.config
     return seq_len * (6 * n + 12 * c.num_hidden_layers * c.hidden_size * seq_len)
 
@@ -189,6 +190,7 @@ def main():
     if cuda:
         model.to(device)
     model.train()
+    n_params = count_params(model)["total"]  # before wrapping: ZeRO-3 leaves numel()==0 on partitioned params
     if cfg.backend == "fsdp":
         model = wrap_fsdp2(model, cfg.bf16, cfg.reshard_after_forward, cfg.prefetch, cfg.act_ckpt,
                            compile_layers=cfg.compile_layers)
@@ -260,7 +262,7 @@ def main():
         f"vision={base.vision.config._attn_implementation}")
     if rank == 0:
         say(f"world={world} backend={cfg.backend} frames={len(ds)} steps/epoch={steps_per_epoch} total={total} "
-              f"micro={cfg.micro_batch} accum={accum} global={cfg.global_batch} params={count_params(base)['total']/1e6:.1f}M",
+              f"micro={cfg.micro_batch} accum={accum} global={cfg.global_batch} params={n_params/1e6:.1f}M",
               flush=True)
 
     step, epoch, in_epoch, best_val = 0, 0, 0, float("inf")
@@ -393,7 +395,7 @@ def main():
                         aux[k] += out[k].detach() / accum
             if flops_s is None:
                 n_img = (mcfg.image_size // 16) ** 2 if not mcfg.tiny else (mcfg.image_size // 16) ** 2
-                flops_s = flops_per_sample(base, n_img + 1 + b["input_ids"].shape[1] + base.n_act_tokens)
+                flops_s = flops_per_sample(base, n_img + 1 + b["input_ids"].shape[1] + base.n_act_tokens, n_params)
             if engine is not None:
                 gn = engine.get_global_grad_norm() or 0.0
             else:
