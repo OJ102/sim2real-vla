@@ -65,6 +65,72 @@ def runs(tmp_path_factory):
     return tmp_path_factory.mktemp("runs")
 
 
+# ------------------------------------------------------------------ process hygiene for Popen'd torchrun runs
+# torchrun workers run in their OWN process groups: os.killpg(agent) reaches only the agent, and SIGKILLing it orphans
+# the workers (reparented to pid 1, still training, still holding the stdout pipe). Kill them by pid.
+def _ps() -> dict:
+    out = subprocess.run(["ps", "-ax", "-o", "pid=,ppid=,command="], capture_output=True, text=True).stdout
+    procs = {}
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3:
+            procs[int(parts[0])] = (int(parts[1]), parts[2])
+    return procs
+
+
+def _descendants(pid: int) -> list:
+    procs, out, todo = _ps(), [], [pid]
+    while todo:
+        cur = todo.pop()
+        for k, (pp, _) in procs.items():
+            if pp == cur:
+                out.append(k); todo.append(k)
+    return out
+
+
+def _kill_tree(p, known=()) -> None:
+    """SIGKILL the agent's live descendants (+ previously seen worker pids, if they are still bc processes) and the
+    agent's group. Only pids whose command line is still a vla.train.bc / torch.distributed.run process are touched
+    (guards against pid reuse)."""
+    procs = _ps()
+    pids = set(_descendants(p.pid)) | {int(k) for k in known}
+    for k in pids:
+        cmd = procs.get(k, (0, ""))[1]
+        if "vla.train.bc" in cmd or "torch.distributed.run" in cmd:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(k, signal.SIGKILL)
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(p.pid, signal.SIGKILL)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        p.wait(timeout=30)
+
+
+def _bc_survivors(data_dir) -> list:
+    """vla.train.bc processes started with this module's data_dir (other sessions' bc runs are not ours)."""
+    tag = f"data_dir={data_dir}"
+    return [(k, c) for k, (_, c) in _ps().items() if "vla.train.bc" in c and tag in c]
+
+
+@pytest.fixture(autouse=True)
+def no_bc_survivors(request):
+    """Teardown check: no vla.train.bc worker may outlive the test that started it (killed + reported if one does)."""
+    yield
+    if "demos" not in request.fixturenames:
+        return
+    demos = request.getfixturevalue("demos")
+    left = []
+    for _ in range(20):                       # workers may need a moment to exit after a clean SIGTERM / save
+        left = _bc_survivors(demos)
+        if not left:
+            return
+        time.sleep(0.5)
+    for k, _ in left:
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(k, signal.SIGKILL)
+    pytest.fail(f"{len(left)} vla.train.bc process(es) survived the test (killed now): "
+                + "; ".join(f"{k}: {c[:160]}" for k, c in left))
+
+
 def _ok(r):
     assert r.returncode == 0, (r.stdout[-1500:] + r.stderr[-2500:])
 
@@ -204,6 +270,7 @@ def test_sigterm_saves_and_resumes(demos, runs):
     name = "preempt"
     p = subprocess.Popen(_cmd(demos, runs, name, ["steps=4000", "ckpt_every=100000", "ckpt_mode=sync"]), cwd=ROOT,
                          env=ENV, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    kids = []
     try:
         t0 = time.time()
         while time.time() - t0 < 240 and not any(m.get("step", 0) >= 10 for m in metrics(runs, name)):
@@ -217,22 +284,17 @@ def test_sigterm_saves_and_resumes(demos, runs):
                 for k in kids:
                     os.kill(int(k), signal.SIGUSR2)
                 time.sleep(3)
-                # torchrun workers run in their own process groups: killpg(agent) alone orphans them (and they keep
-                # the stdout pipe open), so kill them by pid too
-                for k in kids:
-                    with contextlib.suppress(ProcessLookupError):
-                        os.kill(int(k), signal.SIGKILL)
-                os.killpg(p.pid, signal.SIGKILL)
+                _kill_tree(p, kids)                         # workers by pid: they hold the stdout pipe
                 out, _ = p.communicate(timeout=60)
                 errs = "".join(f.read_text()[-3000:] for f in sorted((Path(runs) / name).glob("rank*.err")))
                 steps = [m.get("step") for m in metrics(runs, name)]
                 pytest.fail(f"trainer never reached step 10 in 240 s; metrics steps={steps}\n--- output ---\n"
                             f"{out[-3000:]}\n--- rank*.err (SIGUSR2 stack dumps) ---\n{errs}")
+        kids = _descendants(p.pid)                          # remembered: on failure they must die with the agent
         os.killpg(p.pid, signal.SIGTERM)                    # like a scheduler: whole process group
         out, _ = p.communicate(timeout=120)
     finally:
-        if p.poll() is None:
-            os.killpg(p.pid, signal.SIGKILL)
+        _kill_tree(p, kids)                                 # no-op after a clean exit; never orphans workers
     # torchrun's agent itself exits non-zero when it receives SIGTERM; the contract is the workers' behaviour
     line = [l for l in out.splitlines() if l.startswith("preempted: saved step")]
     assert line, out[-2500:]
@@ -339,6 +401,7 @@ def test_sigusr2_dumps_stacks_and_does_not_kill(demos, runs):
     name = "usr2"
     p = subprocess.Popen(_cmd(demos, runs, name, ["steps=4000", "ckpt_every=100000"]), cwd=ROOT, env=ENV,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    kids = []
     try:
         t0 = time.time()
         while time.time() - t0 < 240 and not any(m.get("step", 0) >= 5 for m in metrics(runs, name)):
@@ -357,8 +420,7 @@ def test_sigusr2_dumps_stacks_and_does_not_kill(demos, runs):
         os.killpg(p.pid, signal.SIGTERM)
         out, _ = p.communicate(timeout=120)
     finally:
-        if p.poll() is None:
-            os.killpg(p.pid, signal.SIGKILL)
+        _kill_tree(p, kids)                                 # no-op after a clean exit; never orphans workers
     errs = "".join((Path(runs) / name / f"rank{r}.err").read_text() for r in (0, 1))   # dumps go to the per-rank err files
     assert "Current thread" in errs or "Thread 0x" in errs, errs[-1500:]
     assert "preempted: saved step" in out
