@@ -1,4 +1,5 @@
 """P4 tests (CPU, gloo, tiny model): BC trainer end to end via torchrun, checkpointing, resume, preemption."""
+import contextlib
 import json
 import os
 import signal
@@ -209,7 +210,24 @@ def test_sigterm_saves_and_resumes(demos, runs):
             assert p.poll() is None, p.stdout.read()
             time.sleep(0.5)
         else:
-            assert any(m.get("step", 0) >= 10 for m in metrics(runs, name)), "trainer never reached step 10"
+            if not any(m.get("step", 0) >= 10 for m in metrics(runs, name)):
+                # flaked once in a full-suite run (alive, no step >= 10 in 240 s; not reproduced in 15 solo runs):
+                # capture worker stacks (SIGUSR2 -> rank*.err) + trainer output so the next occurrence is diagnosable
+                kids = subprocess.run(["pgrep", "-P", str(p.pid)], capture_output=True, text=True).stdout.split()
+                for k in kids:
+                    os.kill(int(k), signal.SIGUSR2)
+                time.sleep(3)
+                # torchrun workers run in their own process groups: killpg(agent) alone orphans them (and they keep
+                # the stdout pipe open), so kill them by pid too
+                for k in kids:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.kill(int(k), signal.SIGKILL)
+                os.killpg(p.pid, signal.SIGKILL)
+                out, _ = p.communicate(timeout=60)
+                errs = "".join(f.read_text()[-3000:] for f in sorted((Path(runs) / name).glob("rank*.err")))
+                steps = [m.get("step") for m in metrics(runs, name)]
+                pytest.fail(f"trainer never reached step 10 in 240 s; metrics steps={steps}\n--- output ---\n"
+                            f"{out[-3000:]}\n--- rank*.err (SIGUSR2 stack dumps) ---\n{errs}")
         os.killpg(p.pid, signal.SIGTERM)                    # like a scheduler: whole process group
         out, _ = p.communicate(timeout=120)
     finally:
