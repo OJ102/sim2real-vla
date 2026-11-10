@@ -373,9 +373,9 @@ stated. GPUs 0 and 1 were shared with other users' inference servers, so many ro
 | Step throughput, baseline vs tuned (4 GPUs, FSDP2) | 594 samples/s, MFU 37.5% to 866 samples/s, MFU 54.7% (1.46x) |
 | 1 / 2 / 4 GPU scaling efficiency (FSDP2) | 1.00 / 0.95 / 0.94 without activation checkpointing, 1.00 / 0.95 / 0.93 with it |
 | 1 / 2 / 4 GPU scaling efficiency (DDP) | 1.00 / 0.96 / 0.93 for both settings |
-| ZeRO-3 (DeepSpeed) | not measured: the backend failed at startup in this sweep (see below) |
+| 1 / 2 / 4 GPU scaling efficiency (DeepSpeed ZeRO-3) | 1.00 / 0.91 / 0.86 without activation checkpointing, 1.00 / 0.93 / 0.89 with it; 2.8x slower than FSDP2 at 4 GPUs |
 | Per-GPU peak memory at 4 GPUs, FSDP2 vs DDP | 12.5 vs 25.8 GB; with activation checkpointing 4.4 vs 13.6 GB |
-| Checkpoint stall per save, sync vs async (`/dev/shm`, 7.0 GB) | 4.97 s vs 0.99 s median over 5 saves (async/sync 0.20) |
+| Checkpoint stall per save, sync vs async (`/dev/shm`, 7.0 GB) | 4.97 s vs 0.99 s (0.20x) and 4.92 s vs 1.25 s (0.25x) in two runs, median over 5 saves each |
 | Kill-and-resume loss difference (4 GPUs, steps 41-60 after resume) | max 3.2e-4 sync, 6.4e-4 async; noise floor before the kill 1.9e-4 / 5.5e-4 |
 
 Step throughput ladder (`results/bench_bc_step.json`, 4 GPUs, FSDP2, 20 timed steps per row, each row adds to the one above):
@@ -411,18 +411,34 @@ What it shows:
 * FSDP2 is also faster than DDP on a single GPU, but the comparison is not like for like. The FSDP2 path keeps bf16
   parameters (`MixedPrecisionPolicy`), while DDP keeps fp32 parameters under bf16 autocast and pays for the casts.
 * Activation checkpointing costs 21-23% throughput and cuts peak memory 43-65%.
-* The ZeRO-3 rows are missing because of a bug. On DeepSpeed 0.19.9, `torch.optim.lr_scheduler.LambdaLR` rejects the
-  wrapped `DeepSpeedZeroOptimizer_Stage3`, so all 12 runs exited at startup. The fix is pending, and these rows will
-  be filled after it.
+* DeepSpeed ZeRO-3 (`results/scaling_ds.json`, same protocol, DeepSpeed 0.19.9 with default bucket and prefetch
+  settings) is the slowest backend and scales worst; see the table below. It shards like FSDP2, but its memory falls
+  less with world size, and at 4 GPUs it needs 16.2 GB against FSDP2's 12.5 GB. The cause of the gap was not profiled.
+  The DeepSpeed settings were not tuned, so this compares defaults, not the best each backend can do.
+  * The logged MFU for ZeRO-3 is wrong (0.2-0.3%). Under ZeRO-3 the FLOP estimate counts the partitioned parameter
+    tensors, which are empty outside a gather. The MFU in the table is recomputed from throughput with FSDP2's FLOPs
+    per sample, since both train the same model.
+  * The first sweep did not produce these rows. On DeepSpeed 0.19.9, `torch.optim.lr_scheduler.LambdaLR` rejected the
+    wrapped `DeepSpeedZeroOptimizer_Stage3`, so all 12 runs exited at startup. The scheduler is now built on the plain
+    AdamW and passed to `deepspeed.initialize`.
 
-Checkpointing (`results/ckpt_stall.json`, 4 GPUs, 7.0 GB DCP checkpoint including optimizer state):
-* On `/dev/shm`, a synchronous save stalls training 4.97 s, against a 0.19 s step. An asynchronous save stalls it
-  0.99 s (staging to pinned host memory), which meets the bar of under 20% of sync.
-  * The write itself overlaps training. Steps take 0.28 s instead of 0.19 s while it runs, and the checkpoint is
-    published in 6.5 s.
-* NFS (`/home2`) is not measured. The NFS saves failed after about 69 s in both modes, and the logged error was too
-  truncated to show why. Plain writes to the same directory run at 106 MB/s, so a 7 GB checkpoint should take
-  about 66 s. Fuller error logging is pending.
+| Backend | GPUs | Act. ckpt | samples/s | MFU (recomputed) | Efficiency | Peak memory per GPU |
+|---|---|---|---|---|---|---|
+| ZeRO-3 | 1 / 2 / 4 | off | 76 / 138 / 259 | 19.4 / 17.7 / 16.7% | 1.00 / 0.91 / 0.86 | 21.6 / 18.4 / 16.2 GB |
+| ZeRO-3 | 1 / 2 / 4 | on | 53 / 98 / 187 | 13.6 / 12.6 / 12.0% | 1.00 / 0.93 / 0.89 | 12.4 / 7.7 / 5.5 GB |
+
+Checkpointing (`results/ckpt_stall.json`, `results/ckpt_stall_v2.json`, 4 GPUs, 7.0 GB DCP checkpoint including
+optimizer state):
+* On `/dev/shm`, a synchronous save stalls training 4.92-4.97 s. An asynchronous save stalls it 0.99 s in one run and
+  1.25 s in the other, for staging to pinned host memory. That is 0.20x and 0.25x of sync.
+  * The plan's bar was under 0.20x. One run is at the bar and the other misses it, so the bar is not claimed as met.
+  * Both runs shared GPUs with other users' jobs. An idle step took 0.19 s in the first run and 0.30 s in the second.
+  * The write itself overlaps training. Steps slow by about 0.1 s while it runs, and the checkpoint is published in
+    6.5-6.7 s.
+* NFS (`/home2`) is not measured. Its saves fail at about 67-70 s in both modes with `OSError: [Errno 28] No space
+  left on device` from `os.fsync`. The filesystem has 163 TB free and a plain 2 GB write succeeds at 106 MB/s, so a
+  per-user quota with less than 7 GB left is the likely cause. The async stall before the failure was 0.5-1.5 s
+  against 67 s for sync, so on a slow filesystem an async save would hide almost all of the write.
 
 Kill-and-resume (`results/resume_gpu.json`): 4 GPUs, 60 steps, checkpoint every 20 steps.
 * The killed run hard-exits after step 47, like `kill -9`, with no save or flush. It is then resumed with `--resume`.
@@ -440,7 +456,10 @@ Two operational failures from this study are also recorded:
 * The first resume run was invalid. Leftover checkpoints from the scaling sweep had filled `/dev/shm`, so every save
   failed. The training loop logs and continues past a failed save, and the "resumed" run had retrained from scratch.
   The test script now checks free space, fails on any failed save, and checks that `resume_from` matches.
-* After a failed async save, one run deadlocked a few steps later (all ranks at 0% GPU for 3 hours). That fix is pending.
+* After a failed async save, one run deadlocked a few steps later (all ranks at 0% GPU for 3 hours). It could not be
+  reproduced on CPU. A related bug was fixed: when the save fails before starting on only some ranks, the ranks
+  disagreed and waited on each other. Now all ranks drop that save, rebuild the save group and keep training. The
+  DataLoader also has a timeout now, and the next resume run will dump every thread's stack if it hangs.
 
 ### Decoupled RL
 
@@ -535,8 +554,7 @@ Fixed along the way:
   both are documented under "RL post-training" with the corrected, paired numbers.
 
 Next:
-* Fix the DeepSpeed scheduler bug, the async-save deadlock and the truncated checkpoint error. Then measure the ZeRO-3
-  rows and the NFS checkpoint stall.
+* NFS checkpoint stall, once there is quota for a 7 GB checkpoint.
 * Randomization ablations on the grounded recipe.
 * Latency benchmark.
 * Demo videos.
