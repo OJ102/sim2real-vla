@@ -543,7 +543,7 @@ Done:
 * Decoupled-RL throughput study: S=0 vs S=1 on 1+1, 2+2 and 1+3 GPU topologies, CUDA-graph vs static engine.
 * Training-system study: step-throughput ladder, FSDP2 and DDP scaling and memory on 1/2/4 GPUs, sync vs async
   checkpoint stall on `/dev/shm`, and a GPU kill-and-resume check for both checkpoint modes.
-* The inference and benchmark code paths exist and are covered by CPU tests (331 passing, 4 GPU-only skipped). Their GPU results are
+* The inference and benchmark code paths exist and are covered by CPU tests (352 passing, 5 skipped: 4 GPU-only, 1 macOS-only). Their GPU results are
   not measured yet.
 
 Fixed along the way:
