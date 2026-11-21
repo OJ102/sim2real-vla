@@ -249,7 +249,15 @@ Every command below is run from the repository root with `.env` sourced.
        --data-dir $VLA_DATA/demos --quiet-wait --trace results/traces --out results/latency.json
    ```
 
-8. **Tables and plots**
+8. **Demo videos** (`results/demo/<name>/`)
+
+   ```bash
+   uv run python scripts/render_demo.py --ckpt $VLA_RUNS/bc_gflow6/best.pt --model-config configs/model_0p5b_txt.yaml \
+       --head flow --data-dir $VLA_DATA/demos --episodes 3 --name bc_gflow6
+   uv run python scripts/render_demo.py --policy expert --episodes 3 --name expert
+   ```
+
+9. **Tables and plots**
 
    ```bash
    uv run python scripts/make_tables.py --results results --runs runs_pulled
@@ -299,7 +307,35 @@ End-effector jerk (RMS, lower is smoother):
 * Discrete baseline: 6.2 to 17.9, with most of its successes on push.
 * Safety-violation counts and success relative to the ceiling are added when the result JSONs are regenerated.
 
-Randomization ablations (short schedule, one seed, labelled as such) and the data-scaling points: TBD.
+Reproducibility check (`results/eval_bc_{gdisc3,gflow6}_r2.json`). After the server's `/dev/shm` was wiped, both
+grounded models were retrained from their archived `config.yaml`. The data regenerated to the same 257,740 frames.
+Training ran on 2 GPUs with accumulation 4 instead of 4 GPUs with accumulation 2, which keeps the global batch at 256
+but changes the data order.
+
+| Model | Run | Val main loss at step 1000 | Grounding error t0 | Train reach / lift / push | Held-out reach / lift / push |
+|---|---|---|---|---|---|
+| Grounded discrete | original | 1.612 | 1.32 cm | 0.855 / 0.610 / 0.460 | 0.450 / 0.290 / 0.205 |
+| Grounded discrete | retrain | 1.636 | 1.57 cm | 0.625 / 0.340 / 0.400 | 0.365 / 0.210 / 0.190 |
+| Grounded flow (warm start from that run's discrete model) | original | | | 0.965 / 0.780 / 0.605 | 0.545 / 0.345 / 0.265 |
+| Grounded flow | retrain | | | 0.960 / 0.740 / 0.565 | 0.565 / 0.295 / 0.265 |
+
+* The flow model reproduces within about 0.05 per cell.
+* The discrete model does not reproduce: train lift drops from 0.61 to 0.34, although validation loss and grounding
+  error differ only slightly. The two runs differ only in data order, so closed-loop success of the discrete head
+  varies a lot between runs. A single discrete run cannot resolve differences of less than about 0.25.
+* So the grounding conclusion holds, since both runs are far above the ungrounded baseline (train lift 0.125). The
+  exact grounded-discrete numbers in the table above are one draw. The ablations below use 2 seeds for this reason.
+* These evaluations could not write their JSON files because the NFS quota was full. The files were rebuilt from the
+  evaluation logs and hold success, Wilson interval and jerk per cell.
+
+Randomization ablations and data scaling:
+* **First attempt: negative.** The plan's short schedule (400 steps, a third of the main run, 1 seed) trained 6 models:
+  the baseline, no camera, no visual and no physics randomization, and 10% and 30% of the data. All 6 score
+  0.00-0.09 on every split (`results/abl400_*.json`). Grounding only takes hold between steps 500 and 750 (see the
+  validation curves), so at 400 steps no model follows the instruction, and the ablations measure nothing.
+* **Second attempt: running.** Full 1200-step schedule, 2 seeds for each of the 5 ablations and a second baseline
+  seed (`results/abl2_<ablation>_s<seed>.json`). Each ablation will be reported against the spread between the two
+  baseline seeds.
 
 ### RL post-training
 
@@ -543,8 +579,15 @@ Done:
 * Decoupled-RL throughput study: S=0 vs S=1 on 1+1, 2+2 and 1+3 GPU topologies, CUDA-graph vs static engine.
 * Training-system study: step-throughput ladder, FSDP2 and DDP scaling and memory on 1/2/4 GPUs, sync vs async
   checkpoint stall on `/dev/shm`, and a GPU kill-and-resume check for both checkpoint modes.
-* The inference and benchmark code paths exist and are covered by CPU tests (352 passing, 5 skipped: 4 GPU-only, 1 macOS-only). Their GPU results are
-  not measured yet.
+* Demo videos (`scripts/render_demo.py`): the grounded flow model and the scripted expert, first 3 evaluation seeds
+  per task and split, greedy, with the instruction and outcome overlaid. Each set has 27 episode videos and a 3x3 grid
+  (rows reach / lift / push, columns train / held-out / held-out photo). They are on the server in `results/demo/`.
+  * The seeds are the first 3 of the evaluation set, not chosen for success. On them the flow model succeeds on
+    reach 3/3 (train) and 2/3 (held-out), lift 2/3 and 1/3, and push 1/3 and 0/3.
+  * The expert succeeds on every cell except held-out push, where it gets 1/3.
+* A reproducibility check of both grounded models after a full retrain (see "Policy results").
+* The inference and benchmark code paths exist and are covered by CPU tests (374 passing, 5 skipped: 4 GPU-only, 1 macOS-only). The latency results on GPU
+  are not measured yet.
 
 Fixed along the way:
 * An rsync `--delete` removed the first set of result JSONs on the server. They were regenerated from the same
@@ -553,11 +596,17 @@ Fixed along the way:
 * The first RL recipe drifted, and the metric used to accept the second was confounded by the rollout seed schedule;
   both are documented under "RL post-training" with the corrected, paired numbers.
 
+Fixed along the way (continued):
+* The server's `/dev/shm` was wiped between runs. That removed the environment, the datasets and every checkpoint,
+  but not the results, which live on NFS.
+  * Everything was rebuilt from the archived configs. The photo textures came from the same source as before, so the
+    held-out photo split is unchanged.
+  * The best checkpoints are now also copied to NFS and checked by md5.
+
 Next:
-* NFS checkpoint stall, once there is quota for a 7 GB checkpoint.
-* Randomization ablations on the grounded recipe.
+* Full-schedule randomization and data-scaling ablations, 2 seeds each (running).
 * Latency benchmark.
-* Demo videos.
+* NFS checkpoint stall, once there is quota for a 7 GB checkpoint.
 
 ## Limitations
 
