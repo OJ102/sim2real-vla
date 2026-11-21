@@ -1,5 +1,37 @@
 # sim2real-vla: closed-loop VLA post-training on a randomized MuJoCo tabletop
 
+<p align="center">
+  <img src="docs/media/hero.gif" width="600" alt="The grounded flow-head VLA following language instructions on four randomized scenes">
+</p>
+<p align="center"><sub>The grounded flow-head policy (<code>bc_gflow6</code>) runs closed loop from camera pixels and a
+language instruction. The four episodes are successes picked from the first evaluation seeds: reach on a held-out photo
+texture, lift on train and held-out scenes, and push. Not every episode succeeds; the unselected grid and the measured
+success rates are below.</sub></p>
+
+**Highlights** (all measured; details and caveats in the sections below)
+* **Language grounding fixed.** The first BC policies ignored the colour word: swapping it changed nothing, and train
+  lift was 0.125. A diagnosis with a first-frame probe led to a fix: text-first token order, an auxiliary
+  target-position loss, colour-swap augmentation, and a warm start for the flow head. After it, train reach went from
+  0.15 to 0.965 and train lift from 0.125 to 0.78.
+* **RL post-training on a VLA.** Decoupled actor-learner GRPO, and Flow-GRPO for the flow-matching head, with
+  truncated importance sampling and an adaptive KL penalty.
+  * Flow-GRPO raised train lift by 0.11 on all 3 seeds, measured against a re-evaluation of the BC model through the
+    same pipeline.
+  * A learning-rate-zero control showed that the first acceptance metric was confounded by the rollout seed schedule.
+    The corrected, paired gain is reported instead.
+* **Distributed training measured.**
+  * Tuning FSDP2 took the 4-GPU training step from 594 to 866 samples/s, at 54.7% MFU.
+  * FSDP2, DDP and DeepSpeed ZeRO-3 compared on 1, 2 and 4 GPUs: FSDP2 keeps 93-95% scaling efficiency and needs half
+    of DDP's memory per GPU.
+  * Async checkpointing cut the save stall from 4.9 s to 1.0-1.3 s, and a GPU kill-and-resume test passes for both
+    checkpoint modes.
+* **Systems debugging.**
+  * A CUDA-graph decode engine produced the wrong tokens, because the KV cache keeps its own write counter. After the
+    fix it is token-exact, and RL rollouts run at 610 env-steps/s against 318.
+  * Overlapping rollout generation with learning gives 1.46x episodes/s on 1+1 GPUs.
+* **Honest negatives kept.** RL round 1 drifted, the first ablation schedule was too short to measure anything, and a
+  retrain of the discrete model shows large run-to-run variance. All three are reported.
+
 This repository trains a small vision-language-action (VLA) policy for a simulated Franka Panda, evaluates it in
 closed loop, and post-trains it with reinforcement learning. The point of the project is the infrastructure around the
 policy: distributed training, checkpointing, a decoupled actor-learner RL loop, and an inference path that is
@@ -295,6 +327,12 @@ The flow head samples noise, so a re-run of the same flow checkpoint moves by up
 | BC + Flow-GRPO, flow head (`rlf_s{0,1,2}`, mean over 3 seeds) | reach | 0.970 | 0.513 | 0.528 |
 | | lift | **0.902** | **0.388** | **0.377** |
 | | push | 0.627 | 0.253 | 0.222 |
+
+Unselected episodes: the first evaluation seed of every task and split, the grounded flow model, greedy. Rows are
+reach, lift and push; columns are train, held-out and held-out photo. Each cell is labelled with its success over the
+first 3 seeds. Failures are kept, mostly push and the held-out splits, as in the table.
+
+<p align="center"><img src="docs/media/grid.gif" width="560" alt="3x3 grid of unselected episodes: tasks by randomization splits"></p>
 
 What the table shows:
 * Grounding lifts reach and lift success 3 to 6x on every split, for both heads.
